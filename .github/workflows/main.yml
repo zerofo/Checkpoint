@@ -1,0 +1,51 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64
+
+    steps:
+    - name: Extract owner and repo
+      uses: winterjung/split@v2.1.0
+      id: repo
+      with:
+        msg: ${{ github.repository }}
+        separator: '/'
+    - name: Checkout project
+      uses: actions/checkout@master
+      with:
+        submodules: recursive
+
+    - name: Build project
+      run: |
+          apt update
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -Syu --noconfirm  libctru citro3d citro2d tex3ds 3ds-curl 3ds-mbedtls
+          dkp-pacman -S libnx switch-pkg-config deko3d switch-harfbuzz switch-freetype switch-libjpeg-turbo switch-curl switch-mbedtls
+          git config --global --add safe.directory `pwd`
+          
+          git submodule update --init --remote --recursive && make switch
+          ls
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        path: out
+        
+    - name: Upload binaries to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.release_token }}
+        file: ./out/*
+        tag: ${{ github.ref }}
+        overwrite: true
+        file_glob: true
+        make_latest: true 
+
