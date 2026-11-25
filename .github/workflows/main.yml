@@ -28,7 +28,7 @@ jobs:
           apt update
           dkp-pacman -Syu --noconfirm
           dkp-pacman -Syu --noconfirm  libctru citro3d citro2d tex3ds 3ds-curl 3ds-mbedtls
-          dkp-pacman -S libnx switch-pkg-config deko3d switch-harfbuzz switch-freetype switch-libjpeg-turbo switch-curl switch-mbedtls
+          dkp-pacman -Syu --noconfirm libnx switch-pkg-config deko3d switch-harfbuzz switch-freetype switch-libjpeg-turbo switch-curl switch-mbedtls
           git config --global --add safe.directory `pwd`
           
           git submodule update --init --remote --recursive && make switch
