@@ -1,6 +1,6 @@
 /*
- *   This file is part of PKSM
- *   Copyright (C) 2016-2025 Bernardo Giordano
+ *   This file is part of Checkpoint
+ *   Copyright (C) 2017-2026 Bernardo Giordano, FlagBrew
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -38,7 +38,22 @@ namespace Logging {
     void initFileLogging(void);
     void exit(void);
 
+    // Installs a std::terminate handler that, before the process dies, forces
+    // the in-flight exception's what() to disk and flushes the log. Any uncaught
+    // throw anywhere (a main-thread overlay, a libnx callback — not only the
+    // script worker's try/catch) then leaves a breadcrumb instead of an
+    // information-free abort. Chains to the previous handler / std::abort so
+    // Atmosphere still writes its crash report (which carries the faulting PC).
+    // Call once, as early as file logging is up.
+    void installCrashHandlers(void);
+
     void log(LogLevel level, const std::string& message);
+
+    // A copy of the accumulated in-memory log (every formatted line since
+    // startup), taken under the log mutex. Backs the Switch settings log viewer
+    // and the /logs/memory HTTP endpoint.
+    std::string getApplicationLogs(void);
+
     void trace(const std::string& message);
     void debug(const std::string& message);
     void info(const std::string& message);

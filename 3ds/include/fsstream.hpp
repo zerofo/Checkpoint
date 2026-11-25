@@ -29,11 +29,18 @@
 
 #include <3ds.h>
 #include <string>
+#include <variant>
+
+// A stream backed by either a regular FS file handle or an FSPXI file handle
+// (the latter is used for decrypted raw GBA VC saves accessed through PxiFS0).
+using MultiHandle = std::variant<FSPXI_File, Handle>;
 
 class FSStream {
 public:
     FSStream(FS_Archive archive, const std::u16string& path, u32 flags);
     FSStream(FS_Archive archive, const std::u16string& path, u32 flags, u32 size);
+    FSStream(FSPXI_Archive archive, u32 flags);
+    FSStream(FSPXI_Archive archive, u32 flags, u32 size);
     ~FSStream() = default;
 
     Result close(void);
@@ -45,9 +52,13 @@ public:
     Result result(void);
     u32 size(void);
     u32 write(const void* buf, u32 size);
+    // Only valid on a stream opened from an FSPXI_Archive (raw GBA VC save).
+    FSPXI_File pxiFile(void) const { return std::get<FSPXI_File>(mHandle); }
 
 private:
-    Handle mHandle;
+    bool isPxi(void) const { return std::holds_alternative<FSPXI_File>(mHandle); }
+
+    MultiHandle mHandle;
     u32 mSize;
     u32 mOffset;
     Result mResult;

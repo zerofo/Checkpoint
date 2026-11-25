@@ -1,6 +1,6 @@
 /*
  *   This file is part of Checkpoint
- *   Copyright (C) 2017-2025 Bernardo Giordano, FlagBrew
+ *   Copyright (C) 2017-2026 Bernardo Giordano, FlagBrew
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -27,7 +27,7 @@
 #ifndef ACCOUNT_HPP
 #define ACCOUNT_HPP
 
-#include "SDLHelper.hpp"
+#include "gfx.hpp"
 #include <map>
 #include <string.h>
 #include <string>
@@ -55,14 +55,16 @@ inline bool operator==(const AccountUid& x, u64 y)
 
 inline bool operator<(const AccountUid& x, const AccountUid& y)
 {
-    return x.uid[0] < y.uid[0] && x.uid[1] == y.uid[1];
+    if (x.uid[0] != y.uid[0])
+        return x.uid[0] < y.uid[0];
+    return x.uid[1] < y.uid[1];
 }
 
 struct User {
     AccountUid id;
     std::string name;
     std::string shortName;
-    SDL_Texture* icon;
+    Texture* icon;
 };
 
 namespace Account {
@@ -70,7 +72,10 @@ namespace Account {
     void exit(void);
 
     std::vector<AccountUid> ids(void);
-    SDL_Texture* icon(AccountUid id);
+    Texture* icon(AccountUid id);
+    // The profile Checkpoint was launched under, or an all-zero uid if the
+    // console can't tell.
+    AccountUid launchUser(void);
     AccountUid selectAccount(void);
     std::string username(AccountUid id);
     std::string shortName(AccountUid id);

@@ -25,35 +25,37 @@
  */
 
 #include "YesNoOverlay.hpp"
+#include "ModalChrome.hpp"
+#include "gfxutils.hpp"
+#include "i18n.hpp"
 
 YesNoOverlay::YesNoOverlay(
     Screen& screen, const std::string& mtext, const std::function<void()>& callbackYes, const std::function<void()>& callbackNo)
     : Overlay(screen), hid(2, 2)
 {
-    text    = mtext;
-    yesFunc = callbackYes;
-    noFunc  = callbackNo;
-    SDLH_GetTextDimensions(28, text.c_str(), &textw, &texth);
-    buttonYes = std::make_unique<Clickable>(322, 462, 316, 56, COLOR_BLACK_DARK, COLOR_WHITE, "Yes", true);
-    buttonNo  = std::make_unique<Clickable>(642, 462, 316, 56, COLOR_BLACK_DARK, COLOR_WHITE, "No", true);
+    // Size the card to the prompt first: the button row sits on its bottom edge.
+    text      = mtext;
+    layout    = ModalChrome::fitText(text);
+    yesFunc   = callbackYes;
+    noFunc    = callbackNo;
+    buttonYes = std::make_unique<Clickable>(
+        ModalChrome::BTN_LEFT_X, layout.btnY, ModalChrome::BTN_HALF_W, ModalChrome::BTN_H, COLOR_SURFACE, COLOR_TEXT, i18n::t("common.yes"), true);
+    buttonNo = std::make_unique<Clickable>(
+        ModalChrome::BTN_RIGHT_X, layout.btnY, ModalChrome::BTN_HALF_W, ModalChrome::BTN_H, COLOR_SURFACE, COLOR_TEXT, i18n::t("common.no"), true);
 }
 
 void YesNoOverlay::draw(void) const
 {
-    SDLH_DrawRect(0, 0, 1280, 720, COLOR_OVERLAY);
-    SDLH_DrawRect(320, 200, 640, 260, COLOR_BLACK_DARK);
-    SDLH_DrawText(28, ceilf(1280 - textw) / 2, 200 + ceilf((260 - texth) / 2), COLOR_WHITE, text.c_str());
-    drawOutline(322, 462, 316, 56, 2, COLOR_GREY_LIGHT);
-    drawOutline(642, 462, 316, 56, 2, COLOR_GREY_LIGHT);
-    buttonYes->draw(28, COLOR_PURPLE_DARK);
-    buttonNo->draw(28, COLOR_PURPLE_DARK);
+    ModalChrome::dim();
+    ModalChrome::drawCard(layout, COLOR_SURFACE);
+    ModalChrome::drawText(layout, text, COLOR_TEXT);
+    drawOutline(ModalChrome::BTN_LEFT_X, layout.btnY, ModalChrome::BTN_HALF_W, ModalChrome::BTN_H, 2, COLOR_TEXT2);
+    drawOutline(ModalChrome::BTN_RIGHT_X, layout.btnY, ModalChrome::BTN_HALF_W, ModalChrome::BTN_H, 2, COLOR_TEXT2);
+    buttonYes->draw(ModalChrome::BTN_SIZE, COLOR_ACCENT);
+    buttonNo->draw(ModalChrome::BTN_SIZE, COLOR_ACCENT);
 
-    if (hid.index() == 0) {
-        drawPulsingOutline(324, 464, 312, 52, 4, COLOR_PURPLE_DARK);
-    }
-    else {
-        drawPulsingOutline(644, 464, 312, 52, 4, COLOR_PURPLE_DARK);
-    }
+    const int bx = hid.index() == 0 ? ModalChrome::BTN_LEFT_X : ModalChrome::BTN_RIGHT_X;
+    drawPulsingOutline(bx + 2, layout.btnY + 2, ModalChrome::BTN_HALF_W - 4, ModalChrome::BTN_H - 4, 4, COLOR_ACCENT);
 }
 
 void YesNoOverlay::update(const InputState& input)
@@ -66,10 +68,13 @@ void YesNoOverlay::update(const InputState& input)
 
     const u64 kDown = input.kDown;
 
+    // Dismiss before running the callback: the yes/no lambdas reassign
+    // currentOverlay (the only owner of this overlay), which would otherwise
+    // destroy the std::function mid-call. dismissThen copies it to the stack.
     if (buttonYes->released() || ((kDown & HidNpadButton_A) && hid.index() == 0)) {
-        yesFunc();
+        dismissThen(yesFunc);
     }
     else if (buttonNo->released() || (kDown & HidNpadButton_B) || ((kDown & HidNpadButton_A) && hid.index() == 1)) {
-        noFunc();
+        dismissThen(noFunc);
     }
 }

@@ -25,14 +25,27 @@
  */
 
 #include "util.hpp"
+#include "backupsize.hpp"
+#include "configuration.hpp"
+#include "ftpserver.hpp"
+#include "i18n.hpp"
 #include "loader.hpp"
+#include "paths.hpp"
 #include "server.hpp"
 #include "thread.hpp"
 #include "title.hpp"
+#include "titlecache.hpp"
 #include <malloc.h>
 
 #define SOC_ALIGN 0x1000
 #define SOC_BUFFERSIZE 0x100000
+
+namespace {
+    void disableNew3DSSpeedup(void)
+    {
+        osSetSpeedupEnable(false);
+    }
+}
 
 Result consoleDisplayError(const std::string& message, Result res)
 {
@@ -53,11 +66,16 @@ Result consoleDisplayError(const std::string& message, Result res)
 Result servicesInit(void)
 {
     Result res = 0;
+
+    // Run New 3DS application cores at 804 MHz. libctru makes this a no-op on
+    // Old 3DS/2DS.
+    osSetSpeedupEnable(true);
+    ATEXIT(disableNew3DSSpeedup);
+
     hidInit();
     ATEXIT(hidExit);
 
     Threads::init(0, 2);
-    ATEXIT(Threads::exit);
 
     gfxInitDefault();
     ATEXIT(gfxExit);
@@ -67,28 +85,43 @@ Result servicesInit(void)
 
     Logging::info("Checkpoint loading started...");
 
-    Handle hbldrHandle;
-    if (R_FAILED(res = svcConnectToPort(&hbldrHandle, "hb:ldr"))) {
-        return consoleDisplayError("Rosalina not found on this system.\nAn updated CFW is required to launch Checkpoint.", res);
+    s64 isEmulator = 0;
+    svcGetSystemInfo(&isEmulator, 0x20000, 0);
+
+    if (!isEmulator) {
+        Handle hbldrHandle;
+        if (R_FAILED(res = svcConnectToPort(&hbldrHandle, "hb:ldr"))) {
+            return consoleDisplayError("Rosalina not found on this system.\nAn updated CFW is required to launch Checkpoint.", res);
+        }
+        svcCloseHandle(hbldrHandle);
     }
-    svcCloseHandle(hbldrHandle);
 
     if (R_FAILED(res = Archive::init())) {
         return consoleDisplayError("Archive::init failed.", res);
     }
     ATEXIT(Archive::exit);
 
+    // Bootstrap the backup tree. Root owned by Paths so the layout is spelled
+    // once; mkdir wants an "sdmc:"-prefixed POSIX path.
+    const std::string ckpt = std::string("sdmc:") + Paths::checkpointRoot();
     mkdir("sdmc:/3ds", 777);
-    mkdir("sdmc:/3ds/Checkpoint", 777);
-    mkdir("sdmc:/3ds/Checkpoint/saves", 777);
-    mkdir("sdmc:/3ds/Checkpoint/extdata", 777);
-    mkdir("sdmc:/3ds/Checkpoint/logs", 777);
-    mkdir("sdmc:/cheats", 777);
+    mkdir(ckpt.c_str(), 777);
+    mkdir((ckpt + "/saves").c_str(), 777);
+    mkdir((ckpt + "/extdata").c_str(), 777);
+    mkdir((ckpt + "/logs").c_str(), 777);
+    // Script drop-in point, so users find where universal scripts go.
+    mkdir((std::string("sdmc:") + Paths::scriptsRoot()).c_str(), 777);
+    mkdir(("sdmc:" + Paths::universalScriptsDir()).c_str(), 777);
 
     Logging::initFileLogging();
 
     romfsInit();
     ATEXIT(romfsExit);
+
+    // Load localized strings before any screen draws. Configuration's singleton
+    // is constructed on first access here, so the language is available at boot.
+    i18n::init("romfs:/i18n.json");
+    i18n::setLanguage(Configuration::getInstance().language());
 
     srvInit();
     ATEXIT(srvExit);
@@ -106,8 +139,10 @@ Result servicesInit(void)
     if (socketBuffer != NULL) {
         if (!socInit(socketBuffer, SOC_BUFFERSIZE)) {
             ATEXIT(socExit);
-            Server::init();
+            Server::init(Configuration::getInstance().serverPort());
             ATEXIT(Server::exit);
+            FTPServer::init();
+            ATEXIT(FTPServer::exit);
         }
         else {
             Logging::warning("socInit failed");
@@ -117,16 +152,43 @@ Result servicesInit(void)
         Logging::warning("Failed to create socket buffer.");
     }
 
-    Threads::executeTask(TitleLoader::loadTitlesThread);
+    // BACKSTOP ONLY for exits that never reach the end of main (early errors, no
+    // workers running yet). The real thread shutdown happens explicitly at the end
+    // of main(), BEFORE exit(): singletons the workers use (BackupSizeCache,
+    // TitleCatalog, …) are lazily constructed after these registrations, so their
+    // destructors run before these handlers would — a live worker would race the
+    // destruction (heap corruption). Threads::exit is idempotent so running it here
+    // after the explicit call is harmless. Order still matters for the backstop:
+    // atexit is LIFO, so these run flags-first, join-second, before any service
+    // teardown; every persistent loop thread must have its stop flag raised before
+    // the join (Server::requestStop here, cart scan via clearCartScanFlag below) or
+    // Threads::exit waits on it forever.
+    ATEXIT(Threads::exit);
+    ATEXIT(BackupSizeCache::shutdownStatic);
+    ATEXIT(Server::requestStop);
+    ATEXIT(FTPServer::requestStop);
 
-    if (Configuration::getInstance().shouldScanCard()) {
-        TitleLoader::cartScanFlagTestAndSet();
-        Threads::create(TitleLoader::cartScan);
-        ATEXIT(TitleLoader::clearCartScanFlag);
+    // Verify TWLN access up front so a missing permission degrades to a logged,
+    // persisted opt-out instead of a per-title failure storm during the scan.
+    if (Configuration::getInstance().dsiwareSaves()) {
+        FS_Archive twln;
+        if (R_FAILED(res = FSUSER_OpenArchive(&twln, ARCHIVE_NAND_TWL_FS, fsMakePath(PATH_EMPTY, "")))) {
+            Logging::error("Failed to open TWLN with result 0x{:08X}; disabling DSiWare saves.", (u32)res);
+            Configuration::getInstance().setDSiWareSaves(false);
+            Configuration::getInstance().commit();
+        }
+        else {
+            FSUSER_CloseArchive(twln);
+        }
     }
 
-    // consoleDebugInit(debugDevice_SVC);
-    // while (aptMainLoop() && !(hidKeysDown() & KEY_START)) { hidScanInput(); }
+    Threads::executeTask(TitleCatalog::loadTitlesThread);
+
+    if (Configuration::getInstance().shouldScanCard()) {
+        TitleCatalog::cartScanFlagTestAndSet();
+        Threads::create(TitleCatalog::cartScan);
+        ATEXIT(TitleCatalog::clearCartScanFlag);
+    }
 
     Logging::info("Checkpoint loading finished!");
 
@@ -137,29 +199,55 @@ void calculateTitleDBHash(u8* hash)
 {
     u32 titleCount, nandCount, titlesRead, nandTitlesRead;
     AM_GetTitleCount(MEDIATYPE_SD, &titleCount);
-    if (Configuration::getInstance().nandSaves()) {
+    const bool nandSaves    = Configuration::getInstance().nandSaves();
+    const bool dsiwareSaves = Configuration::getInstance().dsiwareSaves();
+    // The toggles select which NAND titles the scan keeps, so they are part of
+    // the cache identity even when the installed-title list is unchanged.
+    const u64 configFlags = (nandSaves ? 1 : 0) | (dsiwareSaves ? 2 : 0);
+    // Append the cache format version so a format change invalidates every
+    // existing hash and forces the caches to regenerate.
+    if (nandSaves || dsiwareSaves) {
         AM_GetTitleCount(MEDIATYPE_NAND, &nandCount);
-        std::vector<u64> ordered;
-        ordered.reserve(titleCount + nandCount);
+        std::vector<u64> ordered(titleCount + nandCount);
         AM_GetTitleList(&titlesRead, MEDIATYPE_SD, titleCount, ordered.data());
-        AM_GetTitleList(&nandTitlesRead, MEDIATYPE_NAND, nandCount, ordered.data() + titlesRead * sizeof(u64));
+        AM_GetTitleList(&nandTitlesRead, MEDIATYPE_NAND, nandCount, ordered.data() + titlesRead);
         sort(ordered.begin(), ordered.end());
-        sha256(hash, (u8*)ordered.data(), (titleCount + nandCount) * sizeof(u64));
+        ordered.push_back(TitleCache::FORMAT_VERSION);
+        ordered.push_back(configFlags);
+        sha256(hash, (u8*)ordered.data(), ordered.size() * sizeof(u64));
     }
     else {
-        std::vector<u64> ordered;
-        ordered.reserve(titleCount);
+        std::vector<u64> ordered(titleCount);
         AM_GetTitleList(&titlesRead, MEDIATYPE_SD, titleCount, ordered.data());
         sort(ordered.begin(), ordered.end());
-        sha256(hash, (u8*)ordered.data(), titleCount * sizeof(u64));
+        ordered.push_back(TitleCache::FORMAT_VERSION);
+        ordered.push_back(configFlags);
+        sha256(hash, (u8*)ordered.data(), ordered.size() * sizeof(u64));
     }
 }
 
 std::u16string StringUtils::UTF8toUTF16(const char* src)
 {
-    char16_t tmp[256] = {0};
-    utf8_to_utf16((uint16_t*)tmp, (uint8_t*)src, 256);
-    return std::u16string(tmp);
+    const uint8_t* in = (const uint8_t*)src;
+    ssize_t units     = utf8_to_utf16(nullptr, in, 0);
+    if (units < 0) {
+        return u"";
+    }
+    std::u16string dst(units, u'\0');
+    utf8_to_utf16((uint16_t*)dst.data(), in, units + 1);
+    return dst;
+}
+
+std::string StringUtils::UTF16toUTF8(const std::u16string& src)
+{
+    const uint16_t* in = (const uint16_t*)src.c_str();
+    ssize_t units      = utf16_to_utf8(nullptr, in, 0);
+    if (units < 0) {
+        return "";
+    }
+    std::string dst(units, '\0');
+    utf16_to_utf8((uint8_t*)dst.data(), in, units + 1);
+    return dst;
 }
 
 std::u16string StringUtils::removeForbiddenCharacters(std::u16string src)
@@ -171,16 +259,64 @@ std::u16string StringUtils::removeForbiddenCharacters(std::u16string src)
         }
     }
 
-    size_t i;
-    for (i = src.length() - 1; i > 0 && src[i] == L' '; i--)
-        ;
-    src.erase(i + 1, src.length() - i);
+    // Trim trailing spaces. find_last_not_of handles the empty / all-spaces cases
+    // (npos) without the size()-1 underflow of a reverse index loop.
+    size_t end = src.find_last_not_of(u' ');
+    if (end == std::u16string::npos) {
+        src.clear();
+    }
+    else {
+        src.erase(end + 1);
+    }
 
     return src;
 }
 
-static std::map<u16, charWidthInfo_s*> widthCache;
-static std::queue<u16> widthCacheOrder;
+// One decoder and one glyph-width cache for every text-measuring path.
+namespace {
+    std::map<u16, charWidthInfo_s*> widthCache;
+    std::queue<u16> widthCacheOrder;
+    constexpr size_t WIDTH_CACHE_CAP = 1000;
+
+    // Decodes the UTF-8 codepoint starting at s[i] (BMP only — the cache key is
+    // u16). `extraBytes` is how many continuation bytes follow the lead byte;
+    // invalid or truncated sequences decode as 0xFFFF with no advance.
+    u16 nextCodepoint(const std::string& s, size_t i, int& extraBytes)
+    {
+        u16 codepoint = 0xFFFF;
+        extraBytes    = 0;
+        if (s[i] & 0x80 && s[i] & 0x40 && s[i] & 0x20 && !(s[i] & 0x10) && i + 2 < s.size()) {
+            codepoint  = s[i] & 0x0F;
+            codepoint  = codepoint << 6 | (s[i + 1] & 0x3F);
+            codepoint  = codepoint << 6 | (s[i + 2] & 0x3F);
+            extraBytes = 2;
+        }
+        else if (s[i] & 0x80 && s[i] & 0x40 && !(s[i] & 0x20) && i + 1 < s.size()) {
+            codepoint  = s[i] & 0x1F;
+            codepoint  = codepoint << 6 | (s[i + 1] & 0x3F);
+            extraBytes = 1;
+        }
+        else if (!(s[i] & 0x80)) {
+            codepoint = s[i];
+        }
+        return codepoint;
+    }
+
+    float glyphWidth(u16 codepoint, float scaleX)
+    {
+        auto width = widthCache.find(codepoint);
+        if (width != widthCache.end()) {
+            return width->second->charWidth * scaleX;
+        }
+        widthCache.insert_or_assign(codepoint, fontGetCharWidthInfo(NULL, fontGlyphIndexFromCodePoint(NULL, codepoint)));
+        widthCacheOrder.push(codepoint);
+        if (widthCache.size() > WIDTH_CACHE_CAP) {
+            widthCache.erase(widthCacheOrder.front());
+            widthCacheOrder.pop();
+        }
+        return widthCache[codepoint]->charWidth * scaleX;
+    }
+}
 
 std::string StringUtils::splitWord(const std::string& text, float scaleX, float maxWidth)
 {
@@ -188,43 +324,16 @@ std::string StringUtils::splitWord(const std::string& text, float scaleX, float 
     if (StringUtils::textWidth(word, scaleX) > maxWidth) {
         float currentWidth = 0.0f;
         for (size_t i = 0; i < word.size(); i++) {
-            u16 codepoint = 0xFFFF;
-            int iMod      = 0;
-            if (word[i] & 0x80 && word[i] & 0x40 && word[i] & 0x20 && !(word[i] & 0x10) && i + 2 < word.size()) {
-                codepoint = word[i] & 0x0F;
-                codepoint = codepoint << 6 | (word[i + 1] & 0x3F);
-                codepoint = codepoint << 6 | (word[i + 2] & 0x3F);
-                iMod      = 2;
-            }
-            else if (word[i] & 0x80 && word[i] & 0x40 && !(word[i] & 0x20) && i + 1 < word.size()) {
-                codepoint = word[i] & 0x1F;
-                codepoint = codepoint << 6 | (word[i + 1] & 0x3F);
-                iMod      = 1;
-            }
-            else if (!(word[i] & 0x80)) {
-                codepoint = word[i];
-            }
-            float charWidth;
-            auto width = widthCache.find(codepoint);
-            if (width != widthCache.end()) {
-                charWidth = width->second->charWidth * scaleX;
-            }
-            else {
-                widthCache.insert_or_assign(codepoint, fontGetCharWidthInfo(NULL, fontGlyphIndexFromCodePoint(NULL, codepoint)));
-                widthCacheOrder.push(codepoint);
-                if (widthCache.size() > 512) {
-                    widthCache.erase(widthCacheOrder.front());
-                    widthCacheOrder.pop();
-                }
-                charWidth = widthCache[codepoint]->charWidth * scaleX;
-            }
+            int extraBytes;
+            u16 codepoint   = nextCodepoint(word, i, extraBytes);
+            float charWidth = glyphWidth(codepoint, scaleX);
             currentWidth += charWidth;
             if (currentWidth > maxWidth) {
                 word.insert(i, 1, '\n');
                 currentWidth = charWidth;
             }
 
-            i += iMod; // Yay, variable width encodings
+            i += extraBytes; // Yay, variable width encodings
         }
     }
     return word;
@@ -240,36 +349,10 @@ float StringUtils::textWidth(const std::string& text, float scaleX)
             ret        = 0.0f;
             continue;
         }
-        u16 codepoint = 0xFFFF;
-        if (text[i] & 0x80 && text[i] & 0x40 && text[i] & 0x20 && !(text[i] & 0x10) && i + 2 < text.size()) {
-            codepoint = text[i] & 0x0F;
-            codepoint = codepoint << 6 | (text[i + 1] & 0x3F);
-            codepoint = codepoint << 6 | (text[i + 2] & 0x3F);
-            i += 2;
-        }
-        else if (text[i] & 0x80 && text[i] & 0x40 && !(text[i] & 0x20) && i + 1 < text.size()) {
-            codepoint = text[i] & 0x1F;
-            codepoint = codepoint << 6 | (text[i + 1] & 0x3F);
-            i += 1;
-        }
-        else if (!(text[i] & 0x80)) {
-            codepoint = text[i];
-        }
-        float charWidth;
-        auto width = widthCache.find(codepoint);
-        if (width != widthCache.end()) {
-            charWidth = width->second->charWidth * scaleX;
-        }
-        else {
-            widthCache.insert_or_assign(codepoint, fontGetCharWidthInfo(NULL, fontGlyphIndexFromCodePoint(NULL, codepoint)));
-            widthCacheOrder.push(codepoint);
-            if (widthCache.size() > 1000) {
-                widthCache.erase(widthCacheOrder.front());
-                widthCacheOrder.pop();
-            }
-            charWidth = widthCache[codepoint]->charWidth * scaleX;
-        }
-        ret += charWidth;
+        int extraBytes;
+        u16 codepoint = nextCodepoint(text, i, extraBytes);
+        i += extraBytes;
+        ret += glyphWidth(codepoint, scaleX);
     }
     return std::max(largestRet, ret);
 }
@@ -313,9 +396,8 @@ std::string StringUtils::wrap(const std::string& text, float scaleX, float maxWi
         }
     }
 
-    // "Another iteration" of the loop b/c it probably won't end with a space
-    // If it does, no harm done
-    // word = StringUtils::splitWord(word, scaleX, maxWidth);
+    // "Another iteration" of the loop b/c it probably won't end with a space.
+    // If it does, no harm done.
     if (StringUtils::textWidth(line + word, scaleX) <= maxWidth) {
         dst += line + word;
     }
@@ -340,4 +422,23 @@ float StringUtils::textHeight(const std::string& text, float scaleY)
 {
     size_t n = std::count(text.begin(), text.end(), '\n') + 1;
     return ceilf(scaleY * fontGetInfo(NULL)->lineFeed * n);
+}
+
+std::string StringUtils::humanBytes(u64 bytes)
+{
+    if (bytes >= 1024ull * 1024ull * 1024ull) {
+        return StringUtils::format("%.1f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+    if (bytes >= 1024ull * 1024ull) {
+        return StringUtils::format("%.1f MB", bytes / (1024.0 * 1024.0));
+    }
+    if (bytes >= 1024ull) {
+        return StringUtils::format("%.1f KB", bytes / 1024.0);
+    }
+    return StringUtils::format("%llu B", bytes);
+}
+
+std::string StringUtils::versionString(void)
+{
+    return StringUtils::format("v%d.%d.%d", VERSION_MAJOR, VERSION_MINOR, VERSION_MICRO);
 }

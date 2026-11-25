@@ -25,12 +25,30 @@
  */
 
 #include "main.hpp"
+#include "ChoiceOverlay.hpp"
 #include "MainScreen.hpp"
+#include "ScriptScreen.hpp"
+#include "UpdateOverlay.hpp"
+#include "autoupdater.hpp"
+#include "backupsize.hpp"
+#include "colors.hpp"
+#include "configuration.hpp"
+#include "ftpserver.hpp"
+#include "i18n.hpp"
+#include "loader.hpp"
+#include "scriptlogview.hpp"
+#include "scriptrunner.hpp"
+#include "server.hpp"
+#include "textpool.hpp"
 #include "thread.hpp"
+#include "transfer.hpp"
+#include "transferjob.hpp"
 #include "util.hpp"
+#include <atomic>
 #include <chrono>
+#include <optional>
 
-int main()
+int main(int argc, char* argv[])
 {
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -52,20 +70,110 @@ int main()
         exit(res);
     }
 
+    const std::string executablePath = argc > 0 && argv[0] ? argv[0] : "";
+    std::optional<AutoUpdater::Update> availableUpdate;
+    std::atomic<bool> updateCheckFinished{!Configuration::getInstance().autoUpdate()};
+    bool updatePrompted = false;
+    bool shouldExit     = false;
+
     try {
+        // Remove temp transfer archives a previous crash/power-loss left behind.
+        Transfer::sweepTempFiles();
+
+        // Match the color tokens to the persisted theme before any screen draws.
+        Colors::apply(Configuration::getInstance().theme());
+
+        // Fixes the script log pane's wrap column before any script can print.
+        ScriptScreen::configureLogWidth();
+
         g_screen       = std::make_unique<MainScreen>();
         auto uiIsReady = std::chrono::high_resolution_clock::now();
         Logging::info("Loading took {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(uiIsReady - start).count());
 
-        while (aptMainLoop()) {
+        if (Configuration::getInstance().autoUpdate()) {
+            // Main thread, before the worker exists: see AutoUpdater::init().
+            AutoUpdater::init();
+            if (!Threads::create(Threads::WORKER_STACK, [&availableUpdate, &updateCheckFinished, executablePath]() {
+                    availableUpdate = AutoUpdater::check(executablePath);
+                    updateCheckFinished.store(true, std::memory_order_release);
+                })) {
+                Logging::warning("Could not start auto-update check thread.");
+                updateCheckFinished.store(true, std::memory_order_release);
+            }
+        }
+
+        while (aptMainLoop() && !shouldExit) {
             touchPosition touch;
             hidScanInput();
             hidTouchRead(&touch);
 
             if (hidKeysDown() & KEY_START) {
-                if (!g_isLoadingTitles) {
+                if (g_screen->allowsExit() && !TitleCatalog::get().progress().active && !TransferJob::get().active() &&
+                    !ScriptRunner::get().active() && !AutoUpdater::busy()) {
                     break;
                 }
+            }
+
+            // Script kill switch: hold B to abort the running script (picoc
+            // fails the run at its next statement, so even an infinite loop
+            // dies without rebooting the console). Lives here rather than in
+            // MainScreen::update so it keeps counting while a script-raised
+            // overlay is swallowing that screen's update.
+            static int scriptCancelHold = 0;
+            if (ScriptRunner::get().active() && (hidKeysHeld() & KEY_B)) {
+                if ((hidKeysDown() & KEY_B) && g_screen->hasOverlay()) {
+                    // That press is the overlay's own B (dismiss a gui_message,
+                    // back out of a picker), so the abort count starts from it
+                    // rather than from whatever was already accumulated. Only
+                    // the press is swallowed: holding B on through the overlays
+                    // still aborts, which is what aborttest case 3 exercises.
+                    scriptCancelHold = 0;
+                }
+                else if (++scriptCancelHold >= 45 && !ScriptRunner::get().cancelRequested()) {
+                    ScriptRunner::get().requestCancel();
+                }
+            }
+            else {
+                scriptCancelHold = 0;
+            }
+
+            // Log pane scrolling, here for the same reason as the kill switch:
+            // a script-raised overlay owns update(), and the pane underneath it
+            // must stay scrollable while the user answers.
+            static int scrollHold = 0;
+            if (ScriptScreen::showing()) {
+                // D-Pad left/right pages, but only while no overlay is using the
+                // pad for its own selection.
+                const u32 kDown = hidKeysDown();
+                if ((kDown & (KEY_DLEFT | KEY_DRIGHT)) && !g_screen->hasOverlay()) {
+                    ScriptLogView::get().scrollPages((kDown & KEY_DLEFT) ? -1 : 1);
+                }
+
+                // Line scrolling: D-Pad up/down, and L/R doing exactly the same.
+                // The shoulders are what makes the pane reachable while a script
+                // raises a picker on the bottom screen — its list owns the D-Pad
+                // for as long as the dialog is up, so L/R are ungated where the
+                // pad is not.
+                u32 kHeld = hidKeysHeld() & (KEY_L | KEY_R);
+                if (!g_screen->hasOverlay()) {
+                    kHeld |= hidKeysHeld() & (KEY_DUP | KEY_DDOWN);
+                }
+                if (kHeld) {
+                    // Tap moves one line; holding waits out a short delay and
+                    // then repeats every other frame, so a long transcript is
+                    // still reachable without mashing.
+                    constexpr int DELAY = 20, RATE = 2;
+                    if (scrollHold == 0 || (scrollHold >= DELAY && (scrollHold - DELAY) % RATE == 0)) {
+                        ScriptLogView::get().scrollLines((kHeld & (KEY_DUP | KEY_L)) ? 1 : -1);
+                    }
+                    scrollHold++;
+                }
+                else {
+                    scrollHold = 0;
+                }
+            }
+            else {
+                scrollHold = 0;
             }
 
             C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
@@ -73,7 +181,42 @@ int main()
             C2D_SceneBegin(g_bottom);
             g_screen->doDrawBottom();
             Gui::frameEnd();
+            TextPool::get().frameTick();
             g_screen->doUpdate(InputState{touch});
+
+            // Apply any deferred screen swap requested during doUpdate (e.g.
+            // opening or leaving the Settings page) now that it has returned.
+            if (g_pendingScreen) {
+                g_screen        = std::move(g_pendingScreen);
+                g_pendingScreen = nullptr;
+            }
+
+            // Network work starts only after the UI exists. Raise the prompt on
+            // the UI thread, and wait for any dialog already in use to close.
+            // The catalog scan reads romfs assets, and installing unmounts romfs
+            // to replace the running build, so the prompt also waits it out.
+            if (!updatePrompted && updateCheckFinished.load(std::memory_order_acquire) && availableUpdate && !g_screen->hasOverlay() &&
+                !TitleCatalog::get().progress().active) {
+                updatePrompted                  = true;
+                const auto update               = *availableUpdate;
+                auto screen                     = g_screen;
+                std::shared_ptr<Overlay> prompt = std::make_shared<YesNoOverlay>(
+                    *screen, i18n::t("updater.update_available", {update.version}),
+                    [screen, update, executablePath, &shouldExit]() {
+                        // Hand the transfer to UpdateOverlay: it runs download
+                        // and install on a worker and draws the progress bar,
+                        // so the console never looks frozen mid-update.
+                        std::shared_ptr<Overlay> progress = std::make_shared<UpdateOverlay>(*screen, update, [executablePath, &shouldExit]() {
+                            if (!AutoUpdater::requestRelaunch(executablePath)) {
+                                Logging::warning("Update installed, but automatic relaunch is unavailable.");
+                            }
+                            shouldExit = true;
+                        });
+                        screen->setOverlay(progress);
+                    },
+                    [screen]() { screen->removeOverlay(); });
+                g_screen->setOverlay(prompt);
+            }
         }
     }
     catch (const std::exception& e) {
@@ -82,6 +225,30 @@ int main()
     catch (...) {
         res = consoleDisplayError("Unknown error during main", -6);
     }
+
+    // Stop and join every background thread BEFORE calling exit(). This cannot be
+    // left to the atexit-registered Threads::exit: exit() runs atexit handlers and
+    // static destructors in one LIFO chain ordered by registration time, and the
+    // lazily-constructed singletons workers use (BackupSizeCache, TitleCatalog, …)
+    // are created after servicesInit registered its handlers — so their destructors
+    // run before that Threads::exit would, freeing the maps a live size-walk is
+    // still inserting into (heap corruption, data abort in free()). Raise every
+    // stop flag first, then join; the atexit registrations stay as a backstop for
+    // early-error exits (Threads::exit is idempotent).
+    TitleCatalog::clearCartScanFlag();
+    Server::requestStop();
+    FTPServer::requestStop();
+    BackupSizeCache::shutdownStatic();
+    // A forced APT exit (or an exception out of doUpdate) can end the loop
+    // mid-script. The worker may be parked on the UI bridge waiting for the
+    // loop that just ended, so it has to be aborted and unparked before
+    // Threads::exit() tries to join it — see ScriptRunner::shutdown().
+    ScriptRunner::get().shutdown();
+    Threads::exit();
+    // Stops the ftpd core's own thread and joins it, closing the listen socket
+    // and every live session. Runs here, before the singletons its loop reads
+    // (Configuration, Logging) are torn down.
+    FTPServer::exit();
 
     exit(0);
 }

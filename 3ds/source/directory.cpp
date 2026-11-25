@@ -34,21 +34,36 @@ Directory::Directory(FS_Archive archive, const std::u16string& root)
 
     mError = FSUSER_OpenDirectory(&handle, archive, fsMakePath(PATH_UTF16, root.data()));
     if (R_FAILED(mError)) {
+        Logging::error("FSUSER_OpenDirectory failed with result 0x{:08X} for path {}", mError, StringUtils::UTF16toUTF8(root));
         return;
     }
 
+    // Read entries in batches to amortize the FS service round-trip: one IPC call
+    // per BATCH entries instead of one per entry.
+    static constexpr u32 BATCH = 32;
+    FS_DirectoryEntry batch[BATCH];
     u32 result;
     do {
-        FS_DirectoryEntry item;
-        mError = FSDIR_Read(handle, &result, 1, &item);
-        if (result == 1) {
-            mList.push_back(item);
+        mError = FSDIR_Read(handle, &result, BATCH, batch);
+        if (R_FAILED(mError)) {
+            Logging::error("FSDIR_Read failed with result 0x{:08X} for path {}", mError, StringUtils::UTF16toUTF8(root));
+            break;
         }
-    } while (result);
+        for (u32 i = 0; i < result; i++) {
+            mList.push_back(batch[i]);
+        }
+    } while (result == BATCH);
 
-    mError = FSDIR_Close(handle);
+    Result readError = mError;
+    mError           = FSDIR_Close(handle);
     if (R_FAILED(mError)) {
+        Logging::error("FSDIR_Close failed with result 0x{:08X} for path {}", mError, StringUtils::UTF16toUTF8(root));
         mList.clear();
+        return;
+    }
+
+    if (R_FAILED(readError)) {
+        mError = readError;
         return;
     }
 

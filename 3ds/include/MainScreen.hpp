@@ -1,6 +1,6 @@
 /*
  *   This file is part of Checkpoint
- *   Copyright (C) 2017-2025 Bernardo Giordano, FlagBrew
+ *   Copyright (C) 2017-2026 Bernardo Giordano, FlagBrew
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -27,54 +27,129 @@
 #ifndef MAINSCREEN_HPP
 #define MAINSCREEN_HPP
 
-#include "CheatManagerOverlay.hpp"
-#include "ErrorOverlay.hpp"
-#include "InfoOverlay.hpp"
+#include "BackupList.hpp"
+#include "ChoiceOverlay.hpp"
+#include "MessageOverlay.hpp"
 #include "Screen.hpp"
-#include "YesNoOverlay.hpp"
+#include "TransferOverlay.hpp"
+#include "archive.hpp"
 #include "clickable.hpp"
 #include "gui.hpp"
 #include "multiselection.hpp"
-#include "scrollable.hpp"
 #include "thread.hpp"
+#include "transferstatus.hpp"
 #include <algorithm>
 #include <memory>
+#include <optional>
+#include <string>
 #include <tuple>
+#include <vector>
 
+class Title;
+
+// v4 redesign of the main page: top = title library grid, bottom = title detail
+// (backups list + actions). The backend wiring mirrors MainScreen exactly; only
+// the presentation differs. Built as a parallel Screen so both can coexist while
+// the redesign is wired up gradually.
 class MainScreen : public Screen {
 public:
     MainScreen(void);
-    ~MainScreen(void);
     void drawTop(void) const override;
     void drawBottom(void) const override;
     void update(const InputState& input) override;
 
 protected:
-    int selectorX(size_t i) const;
-    int selectorY(size_t i) const;
+    int cellX(size_t i) const;
+    int cellY(size_t i) const;
     void drawSelector(void) const;
+    void drawTile(size_t k) const;
     void handleEvents(const InputState& input);
+    // Sizes the Backup/Restore pair for the current action row: thirds when Send
+    // shares the row (wireless transfer on), halves of the row when it doesn't.
+    void layoutActionButtons(void);
     void updateSelector(void);
     void updateButtons(void);
+    void refreshTitlesFull(void);
     std::string nameFromCell(size_t index) const;
+    void startTransferSend(void);
+    // Starts the wireless receiver and opens its overlay (or an error overlay).
+    void startTransferReceive(void);
+    // Visual rows in directoryList: 0 = "New backup", 1 = "Receive" (only while
+    // the transfer feature is enabled), then the existing backups. Logical backup
+    // cells (BackupTarget::fullPath indexing: 0 = new, >= 1 = existing) don't know
+    // about the Receive row, so these helpers translate between the two spaces.
+    // They follow selected.transferRow (what the rows on screen were built with),
+    // not the live setting, so input always maps to what the user sees.
+    bool isReceiveRow(size_t row) const;
+    size_t rowToCell(size_t row) const; // invalid for the Receive row; check isReceiveRow first
+    size_t cellToRow(size_t cell) const;
+    // The Yes/No text for a backup of the current selection. A cart whose save
+    // lives in on-cart NAND is read by driving the cartridge directly for a
+    // minute or more, and pulling it mid-read is the one way the user can lose
+    // the save this operation exists to protect, so that case gets its own
+    // warning. `key` is the ordinary message to fall back to.
+    std::string backupConfirmMessage(const char* key) const;
+    // Rebuilds the SelectedTitle snapshot (and the grid favorite pips) when the
+    // selection, backup kind, catalog generation, or size-cache generation moved
+    // since the last frame; no-op otherwise. Also rebuilds directoryList's rows.
+    void refreshSelected(void);
+    void doBackup(size_t fullIndex, size_t cellIndex);
+    void doRestore(size_t fullIndex, size_t cellIndex);
+    // Scans the script folders and raises the picker (Scripts action).
+    void startScriptPicker(void);
+    // While a script runs: raises the overlay for a pending ScriptUiBridge
+    // request (or answers a Keyboard request inline via swkbd).
+    // Runs a restore of the current title's cellIndex backup, gated by the
+    // "Confirm before restore" setting: shows a Yes/No prompt when enabled,
+    // otherwise restores immediately.
+    void requestRestore(size_t cellIndex);
 
 private:
     Hid<HidDirection::HORIZONTAL, HidDirection::VERTICAL> hid;
-    std::unique_ptr<Clickable> buttonBackup, buttonRestore, buttonCheats, buttonPlayCoins;
-    std::unique_ptr<Scrollable> directoryList;
-    char ver[10];
+    std::unique_ptr<Clickable> buttonBackupAL, buttonRestoreAL; // per-title Backup/Restore pair, sized by layoutActionButtons()
+    std::unique_ptr<Clickable> buttonSend;      // middle of the Backup/Send/Restore trio (greyed unless a highlighted backup is sendable)
+    std::unique_ptr<Clickable> buttonBackupAll; // full-width batch Backup shown in multi-select, replacing the two action buttons
+    std::unique_ptr<BackupList> directoryList;
+    std::string ver;
 
-    C2D_Text ins1, ins2, ins3, ins4, c2dId, c2dMediatype;
-    C2D_Text checkpoint, version;
-    // instructions text
-    C2D_Text top_move, top_a, top_y, top_my, top_b, top_hb, bot_ts, bot_x, coins;
-    C2D_TextBuf dynamicBuf, staticBuf;
-
-    const float scaleInst = 0.7f;
-    C2D_ImageTint checkboxTint;
-    C2D_ImageTint flagTint;
+    C2D_ImageTint flagTint;     // teal brand mark
+    C2D_ImageTint checkboxTint; // dark check on the multi-select badge
+    C2D_ImageTint starTint;     // dark star on the gold favorite pip
     int selectionTimer;
-    int refreshTimer;
+    bool transferEnabled;
+    BackupKind backupKind = BackupKind::Save;
+
+    // Value snapshot of everything the detail card (and the grid favorite pips)
+    // needs, rebuilt by refreshSelected() in update() only when its inputs move.
+    // draw*() read this and never query TitleCatalog/BackupSizeCache themselves,
+    // so drawing takes no locks and copies no Title.
+    struct SelectedTitle {
+        bool valid       = false;
+        size_t fullIndex = 0;
+        BackupKind kind  = BackupKind::Save;
+        u32 catalogGen   = 0; // TitleCatalog::generation() at snapshot time
+        u32 sizeGen      = 0; // BackupSizeCache::generation() at snapshot time
+        u64 id           = 0;
+        std::u16string rootPath; // backup root, for the async size-walk request
+        std::string name;        // shortDescription
+        std::string cartId;      // productCode or "System title"
+        std::string mediaType;
+        bool favorite      = false;
+        bool transferRow   = false;   // rows were built with the "Receive" row at index 1
+        size_t backupCount = 0;       // existing backups (action rows excluded)
+        std::optional<u64> totalSize; // async total; nullopt while computing
+    };
+    SelectedTitle selected;
+    std::vector<u8> gridFavorites; // favorite pip per title of the current kind
+
+    // Live transfer state, snapshotted once per frame in update() so drawTop and
+    // drawBottom don't each take the TransferStatus lock and copy the snapshot.
+    TransferSnapshot mTransfer;
+
+    // Frames B has been held while the network-transfer modal is up; requests a
+    // cancel once the hold threshold is reached (guards against a stray tap
+    // killing a long send).
+    int mCancelHoldFrames = 0;
 };
 
 #endif

@@ -25,23 +25,34 @@
  */
 
 #include "archive.hpp"
+#include "csvc.hpp"
+#include "fsstream.hpp"
+
+void ArchiveHandle::close(void)
+{
+    if (!mValid) {
+        return;
+    }
+    if (mRaw) {
+        FSPXI_CloseArchive(FsPxiHandle, mPxi);
+    }
+    else {
+        FSUSER_CloseArchive(mFs);
+    }
+    mValid = false;
+}
 
 static FS_Archive mSdmc;
-static Mode_t mMode = MODE_SAVE;
-
-Mode_t Archive::mode(void)
-{
-    return mMode;
-}
-
-void Archive::mode(Mode_t v)
-{
-    mMode = v;
-}
 
 Result Archive::init(void)
 {
-    return FSUSER_OpenArchive(&mSdmc, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""));
+    Result res = FSUSER_OpenArchive(&mSdmc, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""));
+    if (R_FAILED(res)) {
+        return res;
+    }
+    // Steal a session to the PxiFS0 service so we can talk to FSPXI directly,
+    // which lets us read/write the decrypted raw GBA VC save files.
+    return svcControlService(SERVICEOP_STEAL_CLIENT_SESSION, &FsPxiHandle, "PxiFS0");
 }
 
 void Archive::exit(void)
@@ -67,55 +78,101 @@ Result Archive::save(FS_Archive* archive, FS_MediaType mediatype, u32 lowid, u32
     return 0;
 }
 
+Result Archive::rawSave(FSPXI_Archive* archive, FS_MediaType mediatype, u32 lowid, u32 highid)
+{
+    const u32 path[4] = {lowid, highid, mediatype, 1};
+    return FSPXI_OpenArchive(FsPxiHandle, archive, ARCHIVE_SAVEDATA_AND_CONTENT, {PATH_BINARY, 16, path});
+}
+
 Result Archive::extdata(FS_Archive* archive, u32 ext)
 {
     const u32 path[3] = {MEDIATYPE_SD, ext, 0};
     return FSUSER_OpenArchive(archive, ARCHIVE_EXTDATA, {PATH_BINARY, 12, path});
 }
 
-bool Archive::accessible(FS_MediaType mediatype, u32 lowid, u32 highid)
+SaveDataSource SaveDataSource::ctrSave(FS_MediaType media, u32 lowid, u32 highid)
 {
-    FS_Archive archive;
-    Result res = save(&archive, mediatype, lowid, highid);
-    if (R_SUCCEEDED(res)) {
-        FSUSER_CloseArchive(archive);
-        return true;
-    }
-    return false;
+    return SaveDataSource(Kind::CtrSave, media, lowid, highid);
 }
 
-bool Archive::accessible(u32 ext)
+SaveDataSource SaveDataSource::rawGba(FS_MediaType media, u32 lowid, u32 highid)
 {
-    FS_Archive archive;
-    Result res = extdata(&archive, ext);
-    if (R_SUCCEEDED(res)) {
-        FSUSER_CloseArchive(archive);
-        return true;
-    }
-    return false;
+    return SaveDataSource(Kind::RawGbaSave, media, lowid, highid);
 }
 
-bool Archive::setPlayCoins(void)
+SaveDataSource SaveDataSource::extdata(u32 extdataId)
 {
-    FS_Archive archive;
-    const u32 path[3] = {MEDIATYPE_NAND, 0xF000000B, 0x00048000};
-    Result res        = FSUSER_OpenArchive(&archive, ARCHIVE_SHARED_EXTDATA, {PATH_BINARY, 0xC, path});
-    if (R_SUCCEEDED(res)) {
-        FSStream s(archive, StringUtils::UTF8toUTF16("/gamecoin.dat"), FS_OPEN_READ | FS_OPEN_WRITE);
-        if (s.good()) {
-            int coinAmount = KeyboardManager::get().numericPad();
-            if (coinAmount >= 0) {
-                coinAmount = coinAmount > 300 ? 300 : coinAmount;
-                s.offset(4);
-                u8 buf[2] = {(u8)coinAmount, (u8)(coinAmount >> 8)};
-                s.write(buf, 2);
-            }
+    return SaveDataSource(Kind::Extdata, MEDIATYPE_SD, extdataId, 0);
+}
 
-            s.close();
-            FSUSER_CloseArchive(archive);
-            return true;
+SaveDataSource SaveDataSource::twlSave(u32 lowid, u32 highid)
+{
+    return SaveDataSource(Kind::TwlSave, MEDIATYPE_NAND, lowid, highid);
+}
+
+std::u16string Archive::twlSaveDataPath(u32 lowid, u32 highid)
+{
+    // Normalize the high id to the install category (00030004 DSiWare,
+    // 00030005/00030015 system): TWLN stores titles under 000300xx even though
+    // AM reports them as 000480xx.
+    char path[64];
+    snprintf(path, sizeof(path), "/title/%08lx/%08lx/data/", (highid & 0x00000FFF) | 0x00030000, lowid);
+    return StringUtils::UTF8toUTF16(path);
+}
+
+ArchiveHandle SaveDataSource::open(Result& res) const
+{
+    switch (mKind) {
+        case Kind::CtrSave: {
+            FS_Archive archive;
+            res = Archive::save(&archive, mMedia, mA, mB);
+            return R_SUCCEEDED(res) ? ArchiveHandle::fromFs(archive) : ArchiveHandle();
         }
-        FSUSER_CloseArchive(archive);
+        case Kind::RawGbaSave: {
+            FSPXI_Archive archive;
+            res = Archive::rawSave(&archive, mMedia, mA, mB);
+            return R_SUCCEEDED(res) ? ArchiveHandle::fromPxi(archive) : ArchiveHandle();
+        }
+        case Kind::Extdata: {
+            FS_Archive archive;
+            res = Archive::extdata(&archive, mA);
+            return R_SUCCEEDED(res) ? ArchiveHandle::fromFs(archive) : ArchiveHandle();
+        }
+        case Kind::TwlSave: {
+            FS_Archive archive;
+            res = FSUSER_OpenArchive(&archive, ARCHIVE_NAND_TWL_FS, fsMakePath(PATH_EMPTY, ""));
+            return R_SUCCEEDED(res) ? ArchiveHandle::fromFs(archive) : ArchiveHandle();
+        }
     }
-    return false;
+    res = -1;
+    return ArchiveHandle();
+}
+
+bool SaveDataSource::accessible(void) const
+{
+    Result res           = 0;
+    ArchiveHandle handle = open(res);
+    if (!handle) {
+        return false;
+    }
+    // A raw GBA VC archive opens even when no save is present; it is only really
+    // accessible if the embedded save file opens cleanly.
+    if (mKind == Kind::RawGbaSave) {
+        FSStream file(handle.pxi(), FS_OPEN_READ);
+        bool good = file.good();
+        file.close();
+        return good;
+    }
+    // TWLN opens as a whole; the title is only backupable if its data directory
+    // actually exists on the TWL FAT.
+    if (mKind == Kind::TwlSave) {
+        Handle dir;
+        std::u16string path = Archive::twlSaveDataPath(mA, mB);
+        if (R_FAILED(FSUSER_OpenDirectory(&dir, handle.fs(), fsMakePath(PATH_UTF16, path.data())))) {
+            return false;
+        }
+        FSDIR_Close(dir);
+        return true;
+    }
+    return true;
 }

@@ -27,10 +27,11 @@
 #ifndef INFOOVERLAY_HPP
 #define INFOOVERLAY_HPP
 
+#include "ModalChrome.hpp"
 #include "Overlay.hpp"
-#include "SDLHelper.hpp"
 #include "clickable.hpp"
 #include "colors.hpp"
+#include "gfx.hpp"
 #include <memory>
 #include <string>
 
@@ -44,8 +45,8 @@ public:
     void update(const InputState&) override;
 
 private:
-    u32 textw, texth;
     std::string text;
+    ModalChrome::Layout layout;
     std::unique_ptr<Clickable> button;
 };
 

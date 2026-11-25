@@ -1,6 +1,6 @@
 /*
  *   This file is part of Checkpoint
- *   Copyright (C) 2017-2025 Bernardo Giordano, FlagBrew
+ *   Copyright (C) 2017-2026 Bernardo Giordano, FlagBrew
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -25,61 +25,17 @@
  */
 
 #include "configuration.hpp"
+#include "sortmode.hpp"
+#include "titlecatalog.hpp"
+#include <algorithm>
 
-static struct mg_mgr mgr;
-static struct mg_connection* nc;
-static struct mg_serve_http_opts s_http_server_opts;
-static const char* s_http_port = "8000";
-
-static void handle_populate(struct mg_connection* nc, struct http_message* hm)
-{
-    (void)hm;
-    // populate gets called at startup, assume a new connection has been started
-    blinkLed(2);
-
-    auto json          = Configuration::getInstance().getJson();
-    auto map           = getCompleteTitleList();
-    json["title_list"] = map;
-    std::string body   = json.dump();
-    mg_printf(nc, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n%.*s", (unsigned long)body.length(), (int)body.length(), body.c_str());
-    Logging::info("A new Configuration connection has been handled.");
-}
-
-static void handle_save(struct mg_connection* nc, struct http_message* hm)
-{
-    FILE* f = fopen(Configuration::getInstance().BASEPATH.c_str(), "w");
-    if (f != NULL) {
-        fwrite(hm->body.p, 1, hm->body.len, f);
-        fclose(f);
-        Logging::info("Configurations have been updated.");
-    }
-    else {
-        Logging::error("Failed to write to configuration file with errno {}.", errno);
-    }
-    Configuration::getInstance().load();
-    Configuration::getInstance().parse();
-    // Send response
-    mg_printf(nc, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n%.*s", (unsigned long)hm->body.len, (int)hm->body.len, hm->body.p);
-}
-
-static void ev_handler(struct mg_connection* nc, int ev, void* ev_data)
-{
-    struct http_message* hm = (struct http_message*)ev_data;
-
-    switch (ev) {
-        case MG_EV_HTTP_REQUEST:
-            if (mg_vcmp(&hm->uri, "/save") == 0) {
-                handle_save(nc, hm);
-            }
-            else if (mg_vcmp(&hm->uri, "/populate") == 0) {
-                handle_populate(nc, hm);
-            }
-            else {
-                mg_serve_http(nc, hm, s_http_server_opts);
-            }
-            break;
-        default:
-            break;
+namespace {
+    // Every id in config.json is stored as this same hex string, matching
+    // TitleCatalog::getCompleteTitleList()'s key format so Settings' Library/
+    // Save-folders tabs can look a stored id straight up in that map.
+    std::string hexId(u64 id)
+    {
+        return StringUtils::format("0x%016llX", id);
     }
 }
 
@@ -107,12 +63,32 @@ Configuration::Configuration(void)
             mJson["version"] = CONFIG_VERSION;
             updateJson       = true;
         }
-        if (!(mJson.contains("pksm-bridge") && mJson["pksm-bridge"].is_boolean())) {
-            mJson["pksm-bridge"] = false;
-            updateJson           = true;
-        }
         if (!(mJson.contains("ftp-enabled") && mJson["ftp-enabled"].is_boolean())) {
             mJson["ftp-enabled"] = false;
+            updateJson           = true;
+        }
+        if (!(mJson.contains("mtp-enabled") && mJson["mtp-enabled"].is_boolean())) {
+            mJson["mtp-enabled"] = false;
+            updateJson           = true;
+        }
+        if (!(mJson.contains("transfer-enabled") && mJson["transfer-enabled"].is_boolean())) {
+            mJson["transfer-enabled"] = false;
+            updateJson                = true;
+        }
+        if (!(mJson.contains("confirm-restore") && mJson["confirm-restore"].is_boolean())) {
+            mJson["confirm-restore"] = true; // default: confirm, matching prior always-confirm behavior
+            updateJson               = true;
+        }
+        if (!(mJson.contains("quick-backup") && mJson["quick-backup"].is_boolean())) {
+            mJson["quick-backup"] = false;
+            updateJson            = true;
+        }
+        if (!(mJson.contains("verify-restore") && mJson["verify-restore"].is_boolean())) {
+            mJson["verify-restore"] = false;
+            updateJson              = true;
+        }
+        if (!(mJson.contains("auto-update") && mJson["auto-update"].is_boolean())) {
+            mJson["auto-update"] = true;
             updateJson           = true;
         }
         if (!(mJson.contains("filter") && mJson["filter"].is_array())) {
@@ -126,6 +102,35 @@ Configuration::Configuration(void)
         if (!(mJson.contains("additional_save_folders") && mJson["additional_save_folders"].is_object())) {
             mJson["additional_save_folders"] = nlohmann::json::object();
             updateJson                       = true;
+        }
+        if (!(mJson.contains("additional_device_save_folders") && mJson["additional_device_save_folders"].is_object())) {
+            mJson["additional_device_save_folders"] = nlohmann::json::object();
+            updateJson                              = true;
+        }
+        if (!(mJson.contains("theme") && mJson["theme"].is_string())) {
+            mJson["theme"] = "dark";
+            updateJson     = true;
+        }
+        if (!(mJson.contains("language") && mJson["language"].is_string())) {
+            mJson["language"] = "en";
+            updateJson        = true;
+        }
+        if (!(mJson.contains("last-transfer-address") && mJson["last-transfer-address"].is_string())) {
+            mJson["last-transfer-address"] = "";
+            updateJson                     = true;
+        }
+        if (!(mJson.contains("default-receive-pin") && mJson["default-receive-pin"].is_string())) {
+            mJson["default-receive-pin"] = "";
+            updateJson                   = true;
+        }
+        if (!(mJson.contains("server-port") && mJson["server-port"].is_number_integer() &&
+                TransferProto::validServerPort(mJson["server-port"].get<int64_t>()))) {
+            mJson["server-port"] = TransferProto::kDefaultServerPort;
+            updateJson           = true;
+        }
+        if (!(mJson.contains("sort-mode") && mJson["sort-mode"].is_string())) {
+            mJson["sort-mode"] = SortMode::of(SORT_ALPHA).configKey;
+            updateJson         = true;
         }
         // check every single entry in the arrays...
         for (auto& obj : mJson["filter"]) {
@@ -149,6 +154,13 @@ Configuration::Configuration(void)
                 break;
             }
         }
+        for (auto& obj : mJson["additional_device_save_folders"]) {
+            if (!obj.is_object()) {
+                mJson["additional_device_save_folders"] = nlohmann::json::object();
+                updateJson                              = true;
+                break;
+            }
+        }
     }
 
     if (updateJson) {
@@ -157,19 +169,9 @@ Configuration::Configuration(void)
     }
 
     parse();
-
-    // load server
-    mg_mgr_init(&mgr, NULL);
-    nc = mg_bind(&mgr, s_http_port, ev_handler);
-    mg_set_protocol_http_websocket(nc);
-    s_http_server_opts.document_root = "romfs:/web_root";
-    s_http_server_opts.auth_domain   = "flagbrew.org";
 }
 
-Configuration::~Configuration(void)
-{
-    mg_mgr_free(&mgr);
-}
+Configuration::~Configuration(void) {}
 
 void Configuration::store(void)
 {
@@ -207,14 +209,11 @@ std::vector<std::string> Configuration::additionalSaveFolders(u64 id)
     return folders == mAdditionalSaveFolders.end() ? emptyvec : folders->second;
 }
 
-bool Configuration::isPKSMBridgeEnabled(void)
+std::vector<std::string> Configuration::additionalDeviceSaveFolders(u64 id)
 {
-    return PKSMBridgeEnabled;
-}
-
-void Configuration::pollServer(void)
-{
-    mg_mgr_poll(&mgr, 1000 / 60);
+    std::vector<std::string> emptyvec;
+    auto folders = mAdditionalDeviceSaveFolders.find(id);
+    return folders == mAdditionalDeviceSaveFolders.end() ? emptyvec : folders->second;
 }
 
 void Configuration::save(void)
@@ -244,6 +243,7 @@ void Configuration::parse(void)
     mFilterIds.clear();
     mFavoriteIds.clear();
     mAdditionalSaveFolders.clear();
+    mAdditionalDeviceSaveFolders.clear();
 
     // parse filters
     std::vector<std::string> filter = mJson["filter"];
@@ -257,7 +257,7 @@ void Configuration::parse(void)
         mFavoriteIds.emplace(strtoull(id.c_str(), NULL, 16));
     }
 
-    // parse additional save folders
+    // parse additional save folders (user + device kept as separate lists)
     auto js = mJson["additional_save_folders"];
     for (auto it = js.begin(); it != js.end(); ++it) {
         std::vector<std::string> folders = it.value()["folders"];
@@ -267,24 +267,299 @@ void Configuration::parse(void)
         }
         mAdditionalSaveFolders.emplace(strtoull(it.key().c_str(), NULL, 16), sfolders);
     }
+    auto jsDevice = mJson["additional_device_save_folders"];
+    for (auto it = jsDevice.begin(); it != jsDevice.end(); ++it) {
+        std::vector<std::string> folders = it.value()["folders"];
+        std::vector<std::string> sfolders;
+        for (auto& folder : folders) {
+            sfolders.push_back(folder);
+        }
+        mAdditionalDeviceSaveFolders.emplace(strtoull(it.key().c_str(), NULL, 16), sfolders);
+    }
 
-    // parse PKSM Bridge flag
-    PKSMBridgeEnabled = mJson["pksm-bridge"];
     // parse FTP flag
     FTPEnabled = mJson["ftp-enabled"];
-}
+    // parse MTP flag
+    mMTPEnabled = mJson.value("mtp-enabled", false);
+    // parse wireless-transfer flag
+    mTransferEnabled = mJson.value("transfer-enabled", false);
+    // parse confirm-restore flag
+    mConfirmRestore = mJson.value("confirm-restore", true);
+    // parse quick-backup flag
+    mQuickBackup = mJson.value("quick-backup", false);
+    // parse verify-restore flag
+    mVerifyRestore = mJson.value("verify-restore", false);
+    mAutoUpdate    = mJson.value("auto-update", true);
 
-const char* Configuration::c_str(void)
-{
-    return mJson.dump().c_str();
-}
-
-nlohmann::json Configuration::getJson(void)
-{
-    return mJson;
+    mTheme               = mJson.value("theme", "dark");
+    mLanguage            = mJson.value("language", "en");
+    mLastTransferAddress = mJson.value("last-transfer-address", std::string());
+    mDefaultReceivePin   = mJson.value("default-receive-pin", std::string());
+    mServerPort          = mJson.value("server-port", TransferProto::kDefaultServerPort);
+    mSortMode            = SortMode::fromConfigKey(mJson.value("sort-mode", std::string(SortMode::of(SORT_ALPHA).configKey)));
 }
 
 bool Configuration::isFTPEnabled(void)
 {
     return FTPEnabled;
+}
+
+std::vector<u64> Configuration::hiddenIds(void)
+{
+    return std::vector<u64>(mFilterIds.begin(), mFilterIds.end());
+}
+
+std::vector<u64> Configuration::favoriteIds(void)
+{
+    return std::vector<u64>(mFavoriteIds.begin(), mFavoriteIds.end());
+}
+
+std::vector<u64> Configuration::additionalSaveFolderIds(void)
+{
+    std::vector<u64> ids;
+    ids.reserve(mAdditionalSaveFolders.size());
+    for (const auto& pair : mAdditionalSaveFolders) {
+        ids.push_back(pair.first);
+    }
+    return ids;
+}
+
+std::vector<u64> Configuration::additionalDeviceSaveFolderIds(void)
+{
+    std::vector<u64> ids;
+    ids.reserve(mAdditionalDeviceSaveFolders.size());
+    for (const auto& pair : mAdditionalDeviceSaveFolders) {
+        ids.push_back(pair.first);
+    }
+    return ids;
+}
+
+void Configuration::setFilter(u64 id, bool hidden)
+{
+    if (hidden) {
+        mFilterIds.emplace(id);
+    }
+    else {
+        mFilterIds.erase(id);
+    }
+    mJson["filter"] = std::vector<std::string>(); // rebuild rather than track array-vs-set indices
+    for (u64 filtered : mFilterIds) {
+        mJson["filter"].push_back(hexId(filtered));
+    }
+    save();
+}
+
+void Configuration::setFavorite(u64 id, bool favorite)
+{
+    if (favorite) {
+        mFavoriteIds.emplace(id);
+    }
+    else {
+        mFavoriteIds.erase(id);
+    }
+    mJson["favorites"] = std::vector<std::string>();
+    for (u64 fav : mFavoriteIds) {
+        mJson["favorites"].push_back(hexId(fav));
+    }
+    save();
+}
+
+void Configuration::setFTPEnabled(bool enabled)
+{
+    FTPEnabled           = enabled;
+    mJson["ftp-enabled"] = enabled;
+    save();
+}
+
+bool Configuration::isMTPEnabled(void)
+{
+    return mMTPEnabled;
+}
+
+void Configuration::setMTPEnabled(bool enabled)
+{
+    mMTPEnabled          = enabled;
+    mJson["mtp-enabled"] = enabled;
+    save();
+}
+
+bool Configuration::isTransferEnabled(void)
+{
+    return mTransferEnabled;
+}
+
+void Configuration::setTransferEnabled(bool enabled)
+{
+    mTransferEnabled          = enabled;
+    mJson["transfer-enabled"] = enabled;
+    save();
+}
+
+bool Configuration::isConfirmRestoreEnabled(void)
+{
+    return mConfirmRestore;
+}
+
+void Configuration::setConfirmRestoreEnabled(bool enabled)
+{
+    mConfirmRestore          = enabled;
+    mJson["confirm-restore"] = enabled;
+    save();
+}
+
+bool Configuration::isQuickBackupEnabled(void)
+{
+    return mQuickBackup;
+}
+
+void Configuration::setQuickBackupEnabled(bool enabled)
+{
+    mQuickBackup          = enabled;
+    mJson["quick-backup"] = enabled;
+    save();
+}
+
+bool Configuration::isVerifyRestoreEnabled(void)
+{
+    return mVerifyRestore;
+}
+
+bool Configuration::isAutoUpdateEnabled(void)
+{
+    return mAutoUpdate;
+}
+
+void Configuration::setVerifyRestoreEnabled(bool enabled)
+{
+    mVerifyRestore          = enabled;
+    mJson["verify-restore"] = enabled;
+    save();
+}
+
+void Configuration::setAutoUpdateEnabled(bool enabled)
+{
+    mAutoUpdate          = enabled;
+    mJson["auto-update"] = enabled;
+    save();
+}
+
+void Configuration::addFolder(std::unordered_map<u64, std::vector<std::string>>& map, const char* key, u64 id, const std::string& path)
+{
+    std::vector<std::string>& folders = map[id];
+    if (std::find(folders.begin(), folders.end(), path) != folders.end()) {
+        return;
+    }
+    folders.push_back(path);
+    mJson[key][hexId(id)]["folders"] = folders;
+    save();
+}
+
+void Configuration::removeFolder(std::unordered_map<u64, std::vector<std::string>>& map, const char* key, u64 id, const std::string& path)
+{
+    auto it = map.find(id);
+    if (it == map.end()) {
+        return;
+    }
+    auto& folders = it->second;
+    folders.erase(std::remove(folders.begin(), folders.end(), path), folders.end());
+    if (folders.empty()) {
+        map.erase(it);
+        mJson[key].erase(hexId(id));
+    }
+    else {
+        mJson[key][hexId(id)]["folders"] = folders;
+    }
+    save();
+}
+
+void Configuration::addAdditionalSaveFolder(u64 id, const std::string& path)
+{
+    addFolder(mAdditionalSaveFolders, "additional_save_folders", id, path);
+}
+
+void Configuration::removeAdditionalSaveFolder(u64 id, const std::string& path)
+{
+    removeFolder(mAdditionalSaveFolders, "additional_save_folders", id, path);
+}
+
+void Configuration::addAdditionalDeviceSaveFolder(u64 id, const std::string& path)
+{
+    addFolder(mAdditionalDeviceSaveFolders, "additional_device_save_folders", id, path);
+}
+
+void Configuration::removeAdditionalDeviceSaveFolder(u64 id, const std::string& path)
+{
+    removeFolder(mAdditionalDeviceSaveFolders, "additional_device_save_folders", id, path);
+}
+
+std::string Configuration::theme(void)
+{
+    return mTheme;
+}
+
+void Configuration::setTheme(const std::string& theme)
+{
+    mTheme         = theme;
+    mJson["theme"] = theme;
+    save();
+}
+
+std::string Configuration::language(void)
+{
+    return mLanguage;
+}
+
+void Configuration::setLanguage(const std::string& language)
+{
+    mLanguage         = language;
+    mJson["language"] = language;
+    save();
+}
+
+std::string Configuration::lastTransferAddress(void)
+{
+    return mLastTransferAddress;
+}
+
+void Configuration::setLastTransferAddress(const std::string& address)
+{
+    mLastTransferAddress           = address;
+    mJson["last-transfer-address"] = address;
+    save();
+}
+
+std::string Configuration::defaultReceivePin(void)
+{
+    return mDefaultReceivePin;
+}
+
+void Configuration::setDefaultReceivePin(const std::string& pin)
+{
+    mDefaultReceivePin           = pin;
+    mJson["default-receive-pin"] = pin;
+    save();
+}
+
+u16 Configuration::serverPort(void)
+{
+    return mServerPort;
+}
+
+void Configuration::setServerPort(u16 port)
+{
+    mServerPort          = port;
+    mJson["server-port"] = port;
+    save();
+}
+
+sort_t Configuration::sortMode(void)
+{
+    return mSortMode;
+}
+
+void Configuration::setSortMode(sort_t mode)
+{
+    mSortMode          = mode;
+    mJson["sort-mode"] = SortMode::of(mode).configKey;
+    save();
 }

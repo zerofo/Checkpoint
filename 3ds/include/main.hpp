@@ -1,6 +1,6 @@
 /*
  *   This file is part of Checkpoint
- *   Copyright (C) 2017-2025 Bernardo Giordano, FlagBrew
+ *   Copyright (C) 2017-2026 Bernardo Giordano, FlagBrew
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -29,20 +29,25 @@
 
 #include "Screen.hpp"
 #include "logging.hpp"
+#include <atomic>
 #include <citro2d.h>
+#include <cstdio>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 
 inline std::shared_ptr<Screen> g_screen = nullptr;
-inline bool g_bottomScrollEnabled       = false;
-inline float g_timer                    = 0;
-inline std::string g_selectedCheatKey;
-inline std::vector<std::string> g_selectedCheatCodes;
-inline volatile bool g_isLoadingTitles = false;
-inline int g_loadingTitlesCounter      = 0;
-inline int g_loadingTitlesLimit        = 0;
-
-inline std::u16string g_currentFile;
-inline bool g_isTransferringFile = false;
+// A screen may request replacing g_screen with another (e.g. Main -> Settings).
+// The swap is deferred to the main loop and applied only after the current
+// screen's update() returns, so a screen never destroys itself mid-update.
+inline std::shared_ptr<Screen> g_pendingScreen = nullptr;
+inline bool g_bottomScrollEnabled              = false;
+inline float g_timer                           = 0;
+// Set by the Settings page when a change affects the main title grid or its
+// detail (cart scan, NAND saves, favorites, filters, extra folders). The main
+// screen consumes it on its next update and reloads titles once, so edits show
+// up without the user manually refreshing.
+inline bool g_titlesDirty = false;
 
 #endif

@@ -33,21 +33,32 @@ Directory::Directory(const std::string& root)
     mList.clear();
 
     DIR* dir = opendir(root.c_str());
-    struct dirent* ent;
-
     if (dir == NULL) {
         mError = (Result)errno;
-    }
-    else {
-        while ((ent = readdir(dir))) {
-            std::string name         = std::string(ent->d_name);
-            bool directory           = ent->d_type == DT_DIR;
-            struct DirectoryEntry de = {name, directory};
-            mList.push_back(de);
-        }
+        return;
     }
 
+    // readdir returns NULL both at end of directory and on error, so errno has to
+    // be cleared before each call: otherwise a listing that dies halfway through
+    // is indistinguishable from a complete one, and the caller silently copies (or
+    // verifies) a truncated tree while reporting success. libnx's fsdev signals
+    // plain end-of-directory as ENOENT, which is not a failure.
+    struct dirent* ent;
+    errno = 0;
+    while ((ent = readdir(dir)) != NULL) {
+        struct DirectoryEntry de = {std::string(ent->d_name), ent->d_type == DT_DIR};
+        mList.push_back(de);
+        errno = 0;
+    }
+    const int readErrno = errno;
     closedir(dir);
+
+    if (readErrno != 0 && readErrno != ENOENT) {
+        mError = (Result)readErrno;
+        mList.clear();
+        return;
+    }
+
     mGood = true;
 }
 

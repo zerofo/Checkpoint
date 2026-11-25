@@ -1,6 +1,6 @@
 /*
  *   This file is part of Checkpoint
- *   Copyright (C) 2017-2025 Bernardo Giordano, FlagBrew
+ *   Copyright (C) 2017-2026 Bernardo Giordano, FlagBrew
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -25,7 +25,65 @@
  */
 
 #include "io.hpp"
+#include "backuptarget.hpp"
+#include "csvc.hpp"
+#include "dscard.hpp"
+#include "dscardnand.hpp"
+#include "gbasave.hpp"
 #include "loader.hpp"
+
+// Synthetic failure Result for a short write (FSFILE_Write reported success but
+// committed fewer bytes than requested — typically a full archive). Negative so
+// R_FAILED() is true; the exact value is opaque, the BackupStage carries meaning.
+static const Result RES_SHORT_WRITE = MAKERESULT(RL_PERMANENT, RS_INTERNAL, RM_FS, RD_TOO_LARGE);
+
+// FS returns this (FS module, WrongArgument) when a read runs past the real,
+// allocated data of a sparse / partly-populated extdata file — FSFILE_Read
+// rejects the whole request instead of short-reading. It is not a hard failure:
+// it marks the true end of readable data, which can fall short of the size
+// FSFILE_GetSize reports. See copyFile's shrink-and-stop handling.
+static const u32 RES_FS_PAST_DATA = 0xD900458B;
+
+// FS returns this when another process holds the file open — HOME Menu keeps the
+// icon cache in its own extdata (/CacheD.dat) open for as long as it runs, so no
+// open of it from an application can succeed (#592). See io::dropInUse.
+static const u32 RES_FS_IN_USE = 0xC92044E6;
+
+static const Result RES_PATH_TOO_LONG = 0xE0E046C8;
+
+// FS returns this when the directory being created is already there.
+static const u32 RES_FS_DIR_EXISTS = 0xC82044B9;
+
+static std::u16string rawBackupFile(const std::u16string& folder)
+{
+    std::u16string canonical = folder + StringUtils::UTF8toUTF16("00000001.sav");
+    if (io::fileExists(Archive::sdmc(), canonical)) {
+        return canonical;
+    }
+
+    Directory dir(Archive::sdmc(), folder);
+    if (!dir.good()) {
+        return canonical;
+    }
+    std::u16string only;
+    for (size_t i = 0, sz = dir.size(); i < sz; i++) {
+        if (dir.folder(i)) {
+            continue;
+        }
+        // An AppleDouble sidecar next to the save would otherwise read as a second
+        // candidate and send this back to the canonical name for no reason.
+        if (HostFiles::isMetadata(StringUtils::UTF16toUTF8(dir.entry(i)))) {
+            continue;
+        }
+        if (!only.empty()) {
+            // More than one candidate: stay with the canonical name so the
+            // failure names the file Checkpoint expects.
+            return canonical;
+        }
+        only = folder + dir.entry(i);
+    }
+    return only.empty() ? canonical : only;
+}
 
 bool io::fileExists(const std::string& path)
 {
@@ -41,79 +99,227 @@ bool io::fileExists(FS_Archive archive, const std::u16string& path)
     return exist;
 }
 
-void io::copyFile(FS_Archive srcArch, FS_Archive dstArch, const std::u16string& srcPath, const std::u16string& dstPath)
+static Result collectTreeImpl(FS_Archive arch, const std::u16string& root, const std::u16string& sub, std::vector<io::TreeEntry>& out)
 {
-    g_isTransferringFile = true;
+    // A directory deep enough to overflow FS's path limit would fail the open with
+    // an opaque Result; name it here instead, and stop the walk on the same code
+    // checkPathLengths would report for the entries under it.
+    if (root.length() + sub.length() > io::MAX_PATH_UNITS) {
+        Logging::error("Path too long to enumerate ({} units, limit {}): {}", root.length() + sub.length(), io::MAX_PATH_UNITS,
+            StringUtils::UTF16toUTF8(root + sub));
+        return RES_PATH_TOO_LONG;
+    }
 
+    Directory items(arch, root + sub);
+    if (!items.good()) {
+        return items.error();
+    }
+    for (size_t i = 0, sz = items.size(); i < sz; i++) {
+        std::u16string rel = sub + items.entry(i);
+        if (items.folder(i)) {
+            out.push_back({rel, true});
+            Result res = collectTreeImpl(arch, root, rel + StringUtils::UTF8toUTF16("/"), out);
+            if (R_FAILED(res)) {
+                return res;
+            }
+        }
+        else {
+            out.push_back({rel, false});
+        }
+    }
+    return 0;
+}
+
+Result io::collectTree(FS_Archive arch, const std::u16string& path, std::vector<TreeEntry>& out)
+{
+    return collectTreeImpl(arch, path, StringUtils::UTF8toUTF16(""), out);
+}
+
+Result io::checkPathLengths(const std::vector<TreeEntry>& entries, const std::u16string& srcRoot, const std::u16string& dstRoot)
+{
+    auto tooLong = [](const std::u16string& path) {
+        if (path.length() <= MAX_PATH_UNITS) {
+            return false;
+        }
+        Logging::error("Path too long for FS ({} units, limit {}): {}", path.length(), MAX_PATH_UNITS, StringUtils::UTF16toUTF8(path));
+        return true;
+    };
+
+    if (tooLong(srcRoot) || tooLong(dstRoot)) {
+        return RES_PATH_TOO_LONG;
+    }
+
+    for (const auto& entry : entries) {
+        if (tooLong(srcRoot + entry.rel) || tooLong(dstRoot + entry.rel)) {
+            return RES_PATH_TOO_LONG;
+        }
+    }
+
+    return 0;
+}
+
+size_t io::dropHostMetadata(std::vector<TreeEntry>& entries)
+{
+    // A metadata *directory* has to take its whole subtree with it. collectTree emits
+    // a folder before its contents and every child's rel keeps the parent's prefix,
+    // so testing each component of rel covers the file and the subtree case in one
+    // pass — no need to remember which parents were dropped.
+    const auto isMetadata = [](const std::u16string& rel) {
+        const std::string path = StringUtils::UTF16toUTF8(rel);
+        for (size_t start = 0;;) {
+            const size_t slash = path.find('/', start);
+            const size_t end   = (slash == std::string::npos) ? path.size() : slash;
+            if (HostFiles::isMetadata(path.substr(start, end - start))) {
+                return true;
+            }
+            if (slash == std::string::npos) {
+                return false;
+            }
+            start = slash + 1;
+        }
+    };
+
+    const size_t before = entries.size();
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                      [&isMetadata](const TreeEntry& entry) {
+                          if (!isMetadata(entry.rel)) {
+                              return false;
+                          }
+                          Logging::info("Ignoring host metadata entry in backup: {}.", StringUtils::UTF16toUTF8(entry.rel));
+                          return true;
+                      }),
+        entries.end());
+    return before - entries.size();
+}
+
+std::vector<std::string> io::dropInUse(FS_Archive arch, const std::u16string& root, std::vector<TreeEntry>& entries)
+{
+    // A file that does not exist on the console side (a restore bringing back
+    // something that was since deleted) fails the probe with a different result
+    // and stays in the plan; only the in-use answer drops an entry.
+    std::vector<std::string> dropped;
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                      [&](const TreeEntry& entry) {
+                          if (entry.folder) {
+                              return false;
+                          }
+                          FSStream probe(arch, root + entry.rel, FS_OPEN_READ);
+                          if (probe.good()) {
+                              probe.close();
+                              return false;
+                          }
+                          if ((u32)probe.result() != RES_FS_IN_USE) {
+                              return false;
+                          }
+                          const std::string rel = StringUtils::UTF16toUTF8(entry.rel);
+                          Logging::warning("Leaving out {}: another process holds it open.", rel);
+                          dropped.push_back(rel);
+                          return true;
+                      }),
+        entries.end());
+    return dropped;
+}
+
+Result io::copyFile(
+    FS_Archive srcArch, FS_Archive dstArch, const std::u16string& srcPath, const std::u16string& dstPath, ProgressSink& sink, u8* buffer)
+{
     u32 size = 0;
     FSStream input(srcArch, srcPath, FS_OPEN_READ);
     if (input.good()) {
         size = input.size() > BUFFER_SIZE ? BUFFER_SIZE : input.size();
     }
     else {
-        Logging::error("Failed to open source file {} during copy with result {}. Skipping...", StringUtils::UTF16toUTF8(srcPath), input.result());
-        return;
+        Logging::error("Failed to open source file {} during copy with result {}.", StringUtils::UTF16toUTF8(srcPath), input.result());
+        return input.result();
     }
 
     FSStream output(dstArch, dstPath, FS_OPEN_WRITE, input.size());
-    if (output.good()) {
-        size_t slashpos = srcPath.rfind(StringUtils::UTF8toUTF16("/"));
-        g_currentFile   = srcPath.substr(slashpos + 1, srcPath.length() - slashpos - 1);
-
-        u32 rd;
-        u8* buf = new u8[size];
-        do {
-            rd = input.read(buf, size);
-            output.write(buf, rd);
-
-            // avoid freezing the UI
-            // this will be made less horrible next time...
-            C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-            g_screen->drawTop();
-            C2D_SceneBegin(g_bottom);
-            g_screen->drawBottom();
-            Gui::frameEnd();
-        } while (!input.eof());
-        delete[] buf;
+    if (!output.good()) {
+        Logging::error("Failed to open destination file {} during copy with result {}.", StringUtils::UTF16toUTF8(dstPath), output.result());
+        input.close();
+        return output.result();
     }
-    else {
-        Logging::error(
-            "Failed to open destination file {} during copy with result {}. Skipping...", StringUtils::UTF16toUTF8(dstPath), output.result());
+
+    size_t slashpos = srcPath.rfind(StringUtils::UTF8toUTF16("/"));
+    sink.startFile(srcPath.substr(slashpos + 1, srcPath.length() - slashpos - 1), input.size());
+
+    Result res = 0;
+    u32 offset = 0;
+    u32 chunk  = size; // shrinks toward the readable-data boundary on RES_FS_PAST_DATA
+    do {
+        if (sink.cancelled()) {
+            break;
+        }
+        u32 rd = input.read(buffer, chunk);
+        if (R_FAILED(input.result())) {
+            // Sparse extdata: this offset+chunk runs past the file's real data. Halve
+            // the request to recover any readable prefix at this offset; once even a
+            // single byte can't be read here, we've hit the true end of data — stop
+            // this file cleanly and keep the backup going.
+            if ((u32)input.result() == RES_FS_PAST_DATA) {
+                if (chunk > 1) {
+                    chunk /= 2;
+                    continue;
+                }
+                Logging::info("Reached end of readable data for {} at offset {} (sparse extdata); backing up {} bytes.",
+                    StringUtils::UTF16toUTF8(srcPath), offset, offset);
+                break;
+            }
+            res = input.result();
+            Logging::error("Read failure during copy of {} with result 0x{:08X}.", StringUtils::UTF16toUTF8(srcPath), (u32)res);
+            break;
+        }
+        if (rd == 0) {
+            break;
+        }
+        u32 wt = output.write(buffer, rd);
+        if (R_FAILED(output.result())) {
+            res = output.result();
+            Logging::error("Write failure during copy of {} with result 0x{:08X}.", StringUtils::UTF16toUTF8(dstPath), (u32)res);
+            break;
+        }
+        if (wt != rd) {
+            res = RES_SHORT_WRITE;
+            Logging::error("Short write during copy of {}: wrote {} of {} bytes.", StringUtils::UTF16toUTF8(dstPath), wt, rd);
+            break;
+        }
+        offset += rd;
+        sink.advanceBytes(offset);
+    } while (!input.eof());
+    if (res == 0) {
+        sink.finishFile();
     }
 
     input.close();
     output.close();
-
-    g_isTransferringFile = false;
+    return res;
 }
 
-Result io::copyDirectory(FS_Archive srcArch, FS_Archive dstArch, const std::u16string& srcPath, const std::u16string& dstPath)
+Result io::copyTree(FS_Archive srcArch, FS_Archive dstArch, const std::u16string& srcRoot, const std::u16string& dstRoot,
+    const std::vector<TreeEntry>& entries, ProgressSink& sink)
 {
+    // One scratch buffer for every file in the tree instead of a per-file new/delete.
+    auto buf   = std::make_unique<u8[]>(BUFFER_SIZE);
     Result res = 0;
-    bool quit  = false;
-    Directory items(srcArch, srcPath);
 
-    if (!items.good()) {
-        return items.error();
-    }
-
-    for (size_t i = 0, sz = items.size(); i < sz && !quit; i++) {
-        std::u16string newsrc = srcPath + items.entry(i);
-        std::u16string newdst = dstPath + items.entry(i);
-
-        if (items.folder(i)) {
-            res = io::createDirectory(dstArch, newdst);
-            if (R_SUCCEEDED(res) || (u32)res == 0xC82044B9) {
-                newsrc += StringUtils::UTF8toUTF16("/");
-                newdst += StringUtils::UTF8toUTF16("/");
-                res = io::copyDirectory(srcArch, dstArch, newsrc, newdst);
+    for (const auto& entry : entries) {
+        if (sink.cancelled()) {
+            break;
+        }
+        std::u16string dst = dstRoot + entry.rel;
+        if (entry.folder) {
+            res = io::createDirectory(dstArch, dst);
+            // An existing directory is as good as a new one.
+            if (R_FAILED(res) && (u32)res != RES_FS_DIR_EXISTS) {
+                return res;
             }
-            else {
-                quit = true;
-            }
+            res = 0;
         }
         else {
-            io::copyFile(srcArch, dstArch, newsrc, newdst);
+            res = io::copyFile(srcArch, dstArch, srcRoot + entry.rel, dst, sink, buf.get());
+            if (R_FAILED(res)) {
+                return res;
+            }
         }
     }
 
@@ -140,7 +346,27 @@ bool io::directoryExists(FS_Archive archive, const std::u16string& path)
     return true;
 }
 
-Result io::deleteFolderRecursively(FS_Archive arch, const std::u16string& path)
+size_t io::countFilesRecursively(FS_Archive arch, const std::u16string& path)
+{
+    Directory dir(arch, path);
+    if (!dir.good()) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (size_t i = 0, sz = dir.size(); i < sz; i++) {
+        if (dir.folder(i)) {
+            count += countFilesRecursively(arch, path + dir.entry(i) + StringUtils::UTF8toUTF16("/"));
+        }
+        else {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+Result io::deleteFolderContentsRecursively(FS_Archive arch, const std::u16string& path, ProgressSink* sink)
 {
     Directory dir(arch, path);
     if (!dir.good()) {
@@ -149,246 +375,561 @@ Result io::deleteFolderRecursively(FS_Archive arch, const std::u16string& path)
 
     for (size_t i = 0, sz = dir.size(); i < sz; i++) {
         if (dir.folder(i)) {
-            std::u16string newpath = path + StringUtils::UTF8toUTF16("/") + dir.entry(i) + StringUtils::UTF8toUTF16("/");
-            deleteFolderRecursively(arch, newpath);
+            std::u16string newpath = path + dir.entry(i) + StringUtils::UTF8toUTF16("/");
+            deleteFolderContentsRecursively(arch, newpath, sink);
             newpath = path + dir.entry(i);
             FSUSER_DeleteDirectory(arch, fsMakePath(PATH_UTF16, newpath.data()));
         }
         else {
             std::u16string newpath = path + dir.entry(i);
             FSUSER_DeleteFile(arch, fsMakePath(PATH_UTF16, newpath.data()));
+            if (sink != nullptr) {
+                sink->startFile(dir.entry(i), 0);
+                sink->finishFile();
+            }
         }
     }
 
+    return 0;
+}
+
+Result io::deleteFolderRecursively(FS_Archive arch, const std::u16string& path, ProgressSink* sink)
+{
+    Result res = deleteFolderContentsRecursively(arch, path, sink);
+    if (R_FAILED(res)) {
+        return res;
+    }
     FSUSER_DeleteDirectory(arch, fsMakePath(PATH_UTF16, path.data()));
     return 0;
 }
 
-std::tuple<bool, Result, std::string> io::backup(size_t index, size_t cellIndex)
+// Backs up a DS cartridge whose save lives in on-cart NAND rather than on an
+// SPI EEPROM. Nothing here goes through FS: the bytes come off the cartridge by
+// driving the NTRCARD controller while Process9 still owns the slot
+//
+// Roughly 64 s of card time for a 16-MiB save. That is the poll-synchronised,
+// double-read path's cost, and it is what makes the result trustworthy: three
+// faster builds produced complete, plausible, silently corrupt images.
+static io::IoOutcome backupCardNandSave(
+    const BackupTarget& target, Title& title, const DSCard::NandSave& nand, const std::u16string& dstPath, ProgressSink& sink)
 {
-    const Mode_t mode      = Archive::mode();
-    const bool isNewFolder = cellIndex == 0;
-    Result res             = 0;
+    if (!DSCardNand::available()) {
+        Logging::error("Refusing to back up {}: its save is in on-cart NAND and this build has no NAND read path.", title.shortDescription().c_str());
+        return {false, 0, io::BackupStage::CardNandSave};
+    }
 
-    Title title;
-    TitleLoader::getTitle(title, index);
+    // Checkpoint's own cart-detect poll drives Process9 card IO, which takes the
+    // NTRCARD controller away mid-transfer. Hold it off across the gates and the
+    // whole read.
+    const TitleCatalog::CartScanPause cartScanPause;
+
+    std::unique_ptr<u8[]> banner(new (std::nothrow) u8[0x23C0]);
+    if (!banner) {
+        Logging::error("Card NAND backup: could not allocate the banner comparison buffer.");
+        return {false, 0, io::BackupStage::CardNandSave};
+    }
+    Result res = FSUSER_GetLegacyBannerData(title.mediaType(), 0LL, banner.get());
+    if (R_FAILED(res)) {
+        Logging::error("Card NAND backup: failed to read the legacy banner with result 0x{:08X}.", (u32)res);
+        return {false, res, io::BackupStage::CardNandSave};
+    }
+
+    const DSCardNand::Session session = DSCardNand::prepare(title.mediaType(), nand, banner.get());
+    // The gates are the banner's only consumer, and what follows wants one
+    // contiguous 16-MiB allocation. Holding 9 KiB across that is a needless way
+    // to fragment the heap into refusing it.
+    banner.reset();
+    if (!session.ready) {
+        Logging::error("Card NAND backup of {} refused: the cartridge did not pass the read-only gate chain, so no save data was read.",
+            title.shortDescription().c_str());
+        return {false, 0, io::BackupStage::CardNandSave};
+    }
+
+    // Start from a clean destination folder, exactly as the SPI path does.
+    if (io::directoryExists(Archive::sdmc(), dstPath)) {
+        res = FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
+        if (R_FAILED(res)) {
+            Logging::error("Failed to delete the existing backup directory recursively with result 0x{:08X}.", (u32)res);
+            return {false, res, io::BackupStage::DeleteDst};
+        }
+    }
+    res = io::createDirectory(Archive::sdmc(), dstPath);
+    if (R_FAILED(res)) {
+        Logging::error("Failed to create destination directory with result 0x{:08X}.", (u32)res);
+        return {false, res, io::BackupStage::CreateDst};
+    }
+
+    const std::u16string fileName = StringUtils::UTF8toUTF16(title.shortDescription().c_str()) + StringUtils::UTF8toUTF16(".sav");
+    const std::u16string copyPath = dstPath + StringUtils::UTF8toUTF16("/") + fileName;
+
+    const DSCardNand::DumpOutcome dump = DSCardNand::dumpToFile(title.mediaType(), nand, session, copyPath, sink);
+
+    if (dump.requiresPowerCycle) {
+        Logging::error("Card NAND backup left the cartridge in a state that needs a console power cycle before any further card operation.");
+    }
+
+    if (dump.status == DSCardNand::DumpStatus::Cancelled) {
+        FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
+        Logging::info("Backup of {} cancelled by user.", title.shortDescription().c_str());
+        return {false, 0, io::BackupStage::Copy, true};
+    }
+    if (!dump.ok()) {
+        FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
+        Logging::error("Card NAND backup of {} failed after {} of {} windows; no backup was kept.", title.shortDescription().c_str(),
+            dump.windowsDone, dump.windows);
+        return {false, 0, io::BackupStage::CardNandSave};
+    }
+
+    Logging::info("Card NAND backup of {} wrote {} bytes, sha256={}.", title.shortDescription().c_str(), dump.bytesWritten, dump.sha256);
+
+    TitleCatalog::get().refreshDirectories(title.id());
+    return {true, 0, io::BackupStage::Copy};
+}
+
+static io::IoOutcome restoreCardNandSave(
+    const BackupTarget& target, Title& title, const DSCard::NandSave& nand, const std::u16string& srcPath, ProgressSink& sink)
+{
+    if (!DSCardNand::available()) {
+        Logging::error("Refusing to restore {}: its save is in on-cart NAND and this build has no NAND card path.", title.shortDescription().c_str());
+        return {false, 0, io::BackupStage::CardNandSave};
+    }
+
+    const TitleCatalog::CartScanPause cartScanPause;
+
+    std::unique_ptr<u8[]> banner(new (std::nothrow) u8[0x23C0]);
+    if (!banner) {
+        Logging::error("Card NAND restore: could not allocate the banner comparison buffer.");
+        return {false, 0, io::BackupStage::CardNandSave};
+    }
+    Result res = FSUSER_GetLegacyBannerData(title.mediaType(), 0LL, banner.get());
+    if (R_FAILED(res)) {
+        Logging::error("Card NAND restore: failed to read the legacy banner with result 0x{:08X}.", (u32)res);
+        return {false, res, io::BackupStage::CardNandSave};
+    }
+
+    const DSCardNand::Session session = DSCardNand::prepare(title.mediaType(), nand, banner.get());
+    // The gates are the banner's only consumer, and what follows wants one
+    // contiguous 16-MiB allocation. Holding 9 KiB across that is a needless way
+    // to fragment the heap into refusing it.
+    banner.reset();
+    if (!session.ready) {
+        Logging::error("Card NAND restore of {} refused: the cartridge did not pass the read-only gate chain, so nothing was written.",
+            title.shortDescription().c_str());
+        return {false, 0, io::BackupStage::CardNandSave};
+    }
+
+    const std::u16string fileName = StringUtils::UTF8toUTF16(title.shortDescription().c_str()) + StringUtils::UTF8toUTF16(".sav");
+    const std::u16string fullSrc  = srcPath + StringUtils::UTF8toUTF16("/") + fileName;
+
+    const DSCardNand::RestoreOutcome restored = DSCardNand::restoreFromFile(title.mediaType(), nand, session, fullSrc, sink);
+
+    if (restored.requiresPowerCycle) {
+        Logging::error("Card NAND restore left the cartridge in a state that needs a console power cycle before any further card operation.");
+    }
+
+    if (restored.status == DSCardNand::RestoreStatus::Cancelled) {
+        Logging::info("Restore of {} cancelled by user after {} page(s) were written.", title.shortDescription().c_str(), restored.pagesWritten);
+        return {false, 0, io::BackupStage::Copy, true};
+    }
+
+    if (!restored.ok()) {
+        Logging::error("Card NAND restore of {} failed after {} of {} windows; {} page(s) were written.", title.shortDescription().c_str(),
+            restored.windowsDone, restored.windows, restored.pagesWritten);
+        return {false, 0, io::BackupStage::CardNandSave};
+    }
+
+    Logging::info("Card NAND restore of {} completed: {} page(s) written, {} already matched, source sha256={}.", title.shortDescription().c_str(),
+        restored.pagesWritten, restored.pagesSkipped, restored.sourceSha256);
+    return {true, 0, io::BackupStage::Copy};
+}
+
+// Writes a DS cart save, already read into memory, as a new file in the backup
+// folder the caller has just created.
+//
+// Creating that file has been seen to fail with FS NotFound (0xC8804478) right
+// after the folder was made, and a plain retry by hand worked (#584). So the
+// open is retried a few times, first putting the folder back if FS no longer
+// has it. Each failed open is logged together with whether the folder was still
+// there, which is the part the #584 log could not tell.
+static Result writeCardSave(const std::u16string& folder, const std::u16string& path, const u8* data, u32 size)
+{
+    static constexpr int attempts = 4;
+
+    for (int attempt = 1;; attempt++) {
+        FSStream stream(Archive::sdmc(), path, FS_OPEN_WRITE, size);
+        if (stream.good()) {
+            const u32 wt          = stream.write(data, size);
+            const Result writeRes = stream.result();
+            const Result closeRes = stream.close();
+            if (R_FAILED(writeRes)) {
+                Logging::error("Write failure on {} with result 0x{:08X}.", StringUtils::UTF16toUTF8(path), (u32)writeRes);
+                return writeRes;
+            }
+            if (wt != size) {
+                Logging::error("Short write on {}: wrote {} of {} bytes.", StringUtils::UTF16toUTF8(path), wt, size);
+                return RES_SHORT_WRITE;
+            }
+            if (R_FAILED(closeRes)) {
+                Logging::error("Failed to close {} with result 0x{:08X}.", StringUtils::UTF16toUTF8(path), (u32)closeRes);
+                return closeRes;
+            }
+            if (attempt > 1) {
+                Logging::info("Created {} on attempt {} of {}.", StringUtils::UTF16toUTF8(path), attempt, attempts);
+            }
+            return 0;
+        }
+
+        const Result openRes     = stream.result();
+        const bool folderPresent = io::directoryExists(Archive::sdmc(), folder);
+        Logging::warning("Failed to create {} with result 0x{:08X} (attempt {} of {}, backup folder {}).", StringUtils::UTF16toUTF8(path),
+            (u32)openRes, attempt, attempts, folderPresent ? "present" : "missing");
+        if (attempt == attempts) {
+            return openRes;
+        }
+        if (!folderPresent) {
+            const Result dirRes = io::createDirectory(Archive::sdmc(), folder);
+            if (R_FAILED(dirRes) && (u32)dirRes != RES_FS_DIR_EXISTS) {
+                Logging::warning("Failed to recreate the backup folder with result 0x{:08X}.", (u32)dirRes);
+            }
+        }
+        svcSleepThread(250'000'000);
+    }
+}
+
+io::IoOutcome io::backup(const BackupTarget& target, const std::u16string& dstPath, ProgressSink& sink)
+{
+    Title& title = target.title();
+    Result res   = 0;
 
     Logging::info("Started backup of {}. Title id: 0x{:08X}.", title.shortDescription().c_str(), title.lowId());
 
-    if (title.cardType() == CARD_CTR) {
-        FS_Archive archive;
-        if (mode == MODE_SAVE) {
-            res = Archive::save(&archive, title.mediaType(), title.lowId(), title.highId());
-        }
-        else if (mode == MODE_EXTDATA) {
-            res = Archive::extdata(&archive, title.extdataId());
-        }
+    std::vector<std::string> skippedInUse;
 
-        if (R_SUCCEEDED(res)) {
-            std::string suggestion = DateTime::dateTimeStr();
-
-            std::u16string customPath;
-            if (MS::multipleSelectionEnabled()) {
-                customPath = isNewFolder ? StringUtils::UTF8toUTF16(suggestion.c_str()) : StringUtils::UTF8toUTF16("");
-            }
-            else {
-                customPath = isNewFolder ? KeyboardManager::get().keyboard(suggestion) : StringUtils::UTF8toUTF16("");
-            }
-
-            std::u16string dstPath;
-            if (!isNewFolder) {
-                // we're overriding an existing folder
-                dstPath = mode == MODE_SAVE ? title.fullSavePath(cellIndex) : title.fullExtdataPath(cellIndex);
-            }
-            else {
-                dstPath = mode == MODE_SAVE ? title.savePath() : title.extdataPath();
-                dstPath += StringUtils::UTF8toUTF16("/") + customPath;
-            }
-
-            if (!isNewFolder || io::directoryExists(Archive::sdmc(), dstPath)) {
-                res = FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
-                if (R_FAILED(res)) {
-                    FSUSER_CloseArchive(archive);
-                    Logging::error("Failed to delete the existing backup directory recursively with result 0x{:08X}.", res);
-                    return std::make_tuple(false, res, "Failed to delete the existing backup\ndirectory recursively.");
-                }
-            }
-
-            res = io::createDirectory(Archive::sdmc(), dstPath);
-            if (R_FAILED(res)) {
-                FSUSER_CloseArchive(archive);
-                Logging::error("Failed to create destination directory.");
-                return std::make_tuple(false, res, "Failed to create destination directory.");
-            }
-
-            std::u16string copyPath = dstPath + StringUtils::UTF8toUTF16("/");
-
-            res = io::copyDirectory(archive, Archive::sdmc(), StringUtils::UTF8toUTF16("/"), copyPath);
-            if (R_FAILED(res)) {
-                std::string message = mode == MODE_SAVE ? "Failed to backup save." : "Failed to backup extdata.";
-                FSUSER_CloseArchive(archive);
-                FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
-                Logging::error("{} Result {}.", message, res);
-                return std::make_tuple(false, res, message);
-            }
-
-            TitleLoader::refreshDirectories(title.id());
-        }
-        else {
-            Logging::error("Failed to open save archive with result 0x{:08X}.", res);
-            return std::make_tuple(false, res, "Failed to open save archive.");
+    if (title.cardType() == CARD_CTR || title.isDSiWare()) {
+        ArchiveHandle handle = target.open(res);
+        if (R_FAILED(res)) {
+            Logging::error("Failed to open save archive with result 0x{:08X}.", (u32)res);
+            return {false, res, BackupStage::OpenArchive};
         }
 
-        FSUSER_CloseArchive(archive);
-    }
-    else {
-        CardType cardType = title.SPICardType();
-        u32 saveSize      = SPIGetCapacity(cardType);
-        u32 sectorSize    = (saveSize < 0x10000) ? saveSize : 0x10000;
-
-        std::string suggestion = DateTime::dateTimeStr();
-
-        std::u16string customPath;
-        if (MS::multipleSelectionEnabled()) {
-            customPath = isNewFolder ? StringUtils::UTF8toUTF16(suggestion.c_str()) : StringUtils::UTF8toUTF16("");
-        }
-        else {
-            customPath = isNewFolder ? KeyboardManager::get().keyboard(suggestion) : StringUtils::UTF8toUTF16("");
-        }
-
-        std::u16string dstPath;
-        if (!isNewFolder) {
-            // we're overriding an existing folder
-            dstPath = mode == MODE_SAVE ? title.fullSavePath(cellIndex) : title.fullExtdataPath(cellIndex);
-        }
-        else {
-            dstPath = mode == MODE_SAVE ? title.savePath() : title.extdataPath();
-            dstPath += StringUtils::UTF8toUTF16("/") + customPath;
-        }
-
-        if (!isNewFolder || io::directoryExists(Archive::sdmc(), dstPath)) {
+        // Start from a clean destination folder.
+        if (io::directoryExists(Archive::sdmc(), dstPath)) {
             res = FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
             if (R_FAILED(res)) {
-                Logging::error("Failed to delete the existing backup directory recursively with result 0x{:08X}.", res);
-                return std::make_tuple(false, res, "Failed to delete the existing\nbackup directory recursively.");
+                Logging::error("Failed to delete the existing backup directory recursively with result 0x{:08X}.", (u32)res);
+                return {false, res, BackupStage::DeleteDst};
             }
         }
 
         res = io::createDirectory(Archive::sdmc(), dstPath);
         if (R_FAILED(res)) {
-            Logging::error("Failed to create destination directory with result 0x{:08X}.", res);
-            return std::make_tuple(false, res, "Failed to create destination directory.");
+            Logging::error("Failed to create destination directory.");
+            return {false, res, BackupStage::CreateDst};
         }
 
-        std::u16string copyPath =
-            dstPath + StringUtils::UTF8toUTF16("/") + StringUtils::UTF8toUTF16(title.shortDescription().c_str()) + StringUtils::UTF8toUTF16(".sav");
+        if (handle.isRaw()) {
+            std::u16string savePath = dstPath + StringUtils::UTF8toUTF16("/00000001.sav");
 
-        u8* saveFile = new u8[saveSize];
-        for (u32 i = 0; i < saveSize / sectorSize; ++i) {
-            res = SPIReadSaveData(cardType, sectorSize * i, saveFile + sectorSize * i, sectorSize);
-            if (R_FAILED(res)) {
-                delete[] saveFile;
+            sink.begin("Backup", 1);
+            res = GbaSave::backup(handle.pxi(), Archive::sdmc(), savePath, sink);
+            sink.end();
+            if (sink.cancelled()) {
                 FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
-                Logging::error("Failed to read save data from SPI with result 0x{:08X}.", res);
-                return std::make_tuple(false, res, "Failed to backup save.");
+                Logging::info("Backup of {} cancelled by user.", title.shortDescription().c_str());
+                return {false, 0, BackupStage::Copy, true};
+            }
+            if (R_FAILED(res)) {
+                FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
+                Logging::error("Failed to backup GBA save. Result {}.", res);
+                return {false, res, BackupStage::Copy};
+            }
+        }
+        else {
+            std::u16string copyPath = dstPath + StringUtils::UTF8toUTF16("/");
+
+            // A DSiWare save is not its own archive: it's the title's data
+            // directory inside the TWL NAND FAT, so the copy is rooted there.
+            const std::u16string archiveRoot =
+                title.isDSiWare() ? Archive::twlSaveDataPath(title.lowId(), title.highId()) : StringUtils::UTF8toUTF16("/");
+
+            std::vector<io::TreeEntry> entries;
+            res = io::collectTree(handle.fs(), archiveRoot, entries);
+            if (R_FAILED(res)) {
+                FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
+                Logging::error("Failed to enumerate {} for backup. Result {}.", target.dataTypeName(), res);
+                return {false, res, (u32)res == RES_PATH_TOO_LONG ? BackupStage::PathTooLong : BackupStage::Copy};
+            }
+
+            // Extdata can share an archive with a running system process; a file it
+            // holds open can't be read at all, and failing the whole backup over
+            // HOME Menu's icon cache left users with no backup of the rest (#592).
+            // A save is never filtered: it is copied whole or not at all.
+            if (target.kind() == BackupKind::Extdata) {
+                skippedInUse = io::dropInUse(handle.fs(), archiveRoot, entries);
+            }
+
+            // The console-side tree is short; it is the SD destination — root plus
+            // title folder plus the backup name the user just typed — that can push
+            // a deep save over the limit. Say so now, not half a copy in.
+            res = io::checkPathLengths(entries, archiveRoot, copyPath);
+            if (R_FAILED(res)) {
+                FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
+                Logging::error("Refusing to back up {}: the destination folder name makes a path FS cannot create.", target.dataTypeName());
+                return {false, res, BackupStage::PathTooLong};
+            }
+
+            size_t fileCount = 0;
+            for (const auto& e : entries) {
+                if (!e.folder) {
+                    fileCount++;
+                }
+            }
+
+            sink.begin("Backup", fileCount);
+            res = io::copyTree(handle.fs(), Archive::sdmc(), archiveRoot, copyPath, entries, sink);
+            sink.end();
+            if (sink.cancelled()) {
+                FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
+                Logging::info("Backup of {} cancelled by user.", title.shortDescription().c_str());
+                return {false, 0, BackupStage::Copy, true};
+            }
+            if (R_FAILED(res)) {
+                FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
+                Logging::error("Failed to backup {}. Result {}.", target.dataTypeName(), res);
+                return {false, res, BackupStage::Copy};
             }
         }
 
-        FSStream stream(Archive::sdmc(), copyPath, FS_OPEN_WRITE, saveSize);
-        if (stream.good()) {
-            stream.write(saveFile, saveSize);
+        TitleCatalog::get().refreshDirectories(title.id());
+    }
+    else {
+        CardType cardType = title.SPICardType();
+        u32 saveSize      = SPIGetCapacity(cardType);
+        // NO_CHIP / an unreadable cart reports 0 capacity; guard the division below.
+        if (saveSize == 0) {
+            // A cart whose save is in on-cart NAND has no SPI chip to report a
+            // capacity, so it lands here.
+            const DSCard::NandSave nand = DSCard::probeNandSave(title.mediaType());
+            if (nand.present) {
+                DSCard::logNandSave(nand);
+                return backupCardNandSave(target, title, nand, dstPath, sink);
+            }
+            Logging::error("SPI backup: card reports zero capacity ({}).", (int)cardType);
+            return {false, res, BackupStage::OpenArchive};
         }
-        else {
-            delete[] saveFile;
-            stream.close();
-            FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
-            Logging::error("Failed to delete directory recursively after failing to write save to the sd card with result 0x{:08X}.", res);
-            return std::make_tuple(false, res, "Failed to backup save.");
+        u32 sectorSize = (saveSize < 0x10000) ? saveSize : 0x10000;
+
+        std::u16string fileName = StringUtils::UTF8toUTF16(title.shortDescription().c_str()) + StringUtils::UTF8toUTF16(".sav");
+        std::u16string copyPath = dstPath + StringUtils::UTF8toUTF16("/") + fileName;
+
+        sink.begin("Backup", 1);
+        sink.startFile(fileName, saveSize);
+
+        // The whole save comes off the cart before the SD card is touched. A read
+        // failure or a cancel then leaves the backup being overwritten as it was,
+        // and the destination folder is created right before its file instead of
+        // a whole cart read earlier (#584).
+        std::unique_ptr<u8[]> saveFile(new u8[saveSize]);
+        const u32 sectors = saveSize / sectorSize;
+        for (u32 i = 0; i < sectors; ++i) {
+            if (sink.cancelled()) {
+                sink.end();
+                Logging::info("Backup of {} cancelled by user.", title.shortDescription().c_str());
+                return {false, 0, BackupStage::Copy, true};
+            }
+            res = SPIReadSaveData(cardType, sectorSize * i, saveFile.get() + sectorSize * i, sectorSize);
+            if (R_FAILED(res)) {
+                sink.end();
+                Logging::error("Failed to read save data from SPI with result 0x{:08X}.", (u32)res);
+                return {false, res, BackupStage::ReadSpi};
+            }
+            sink.advanceBytes(sectorSize * (i + 1));
         }
 
-        delete[] saveFile;
-        stream.close();
-        TitleLoader::refreshDirectories(title.id());
+        // Start from a clean destination folder.
+        if (io::directoryExists(Archive::sdmc(), dstPath)) {
+            res = FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
+            if (R_FAILED(res)) {
+                sink.end();
+                Logging::error("Failed to delete the existing backup directory recursively with result 0x{:08X}.", (u32)res);
+                return {false, res, BackupStage::DeleteDst};
+            }
+        }
+
+        res = io::createDirectory(Archive::sdmc(), dstPath);
+        if (R_FAILED(res)) {
+            sink.end();
+            Logging::error("Failed to create destination directory with result 0x{:08X}.", (u32)res);
+            return {false, res, BackupStage::CreateDst};
+        }
+
+        res = writeCardSave(dstPath, copyPath, saveFile.get(), saveSize);
+        if (R_FAILED(res)) {
+            sink.end();
+            FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, dstPath.data()));
+            Logging::error("Failed to write save to the sd card with result 0x{:08X}.", (u32)res);
+            return {false, res, BackupStage::WriteFile};
+        }
+
+        sink.finishFile();
+        sink.end();
+        TitleCatalog::get().refreshDirectories(title.id());
     }
 
-    Logging::info("Backup succeeded.");
-    return std::make_tuple(true, 0, "Progress correctly saved to disk.");
+    if (!skippedInUse.empty()) {
+        Logging::info("Backup succeeded, leaving out {} file(s) held open by another process.", skippedInUse.size());
+    }
+    else {
+        Logging::info("Backup succeeded.");
+    }
+    return {true, 0, BackupStage::Copy, false, std::move(skippedInUse)};
 }
 
-std::tuple<bool, Result, std::string> io::restore(size_t index, size_t cellIndex, const std::string& nameFromCell)
+io::IoOutcome io::restore(const BackupTarget& target, const std::u16string& srcPath, ProgressSink& sink)
 {
-    const Mode_t mode = Archive::mode();
-    Result res        = 0;
-
-    Title title;
-    TitleLoader::getTitle(title, index);
+    Title& title = target.title();
+    Result res   = 0;
 
     Logging::info("Started restore of {}. Title id: 0x{:08X}.", title.shortDescription().c_str(), title.lowId());
 
-    if (title.cardType() == CARD_CTR) {
-        FS_Archive archive;
-        if (mode == MODE_SAVE) {
-            res = Archive::save(&archive, title.mediaType(), title.lowId(), title.highId());
-        }
-        else if (mode == MODE_EXTDATA) {
-            res = Archive::extdata(&archive, title.extdataId());
+    std::vector<std::string> skippedInUse;
+
+    if (title.cardType() == CARD_CTR || title.isDSiWare()) {
+        ArchiveHandle handle = target.open(res);
+        if (R_FAILED(res)) {
+            Logging::error("Failed to open save archive with result 0x{:08X}.", (u32)res);
+            return {false, res, BackupStage::OpenArchive};
         }
 
-        if (R_SUCCEEDED(res)) {
-            std::u16string srcPath = mode == MODE_SAVE ? title.fullSavePath(cellIndex) : title.fullExtdataPath(cellIndex);
-            srcPath += StringUtils::UTF8toUTF16("/");
-            std::u16string dstPath = StringUtils::UTF8toUTF16("/");
+        std::u16string fullSrc = srcPath + StringUtils::UTF8toUTF16("/");
 
-            if (mode != MODE_EXTDATA) {
-                FSUSER_DeleteDirectoryRecursively(archive, fsMakePath(PATH_UTF16, dstPath.data()));
+        if (handle.isRaw()) {
+            fullSrc = rawBackupFile(fullSrc);
+
+            sink.begin("Restore", 1);
+            res = GbaSave::restore(handle.pxi(), Archive::sdmc(), fullSrc, sink);
+            sink.end();
+            if (R_FAILED(res)) {
+                Logging::error("Failed to restore GBA save. Result {}.", res);
+                return {false, res, BackupStage::Copy};
+            }
+        }
+        else {
+            const bool isTwl       = title.isDSiWare();
+            std::u16string dstPath = isTwl ? Archive::twlSaveDataPath(title.lowId(), title.highId()) : StringUtils::UTF8toUTF16("/");
+
+            // Walk and vet the backup *before* touching what is on the console: a
+            // source that can't be enumerated, or that holds a path FS will refuse,
+            // must not cost the user the save that is still there.
+            std::vector<io::TreeEntry> entries;
+            res = io::collectTree(Archive::sdmc(), fullSrc, entries);
+            if (R_FAILED(res)) {
+                Logging::error("Failed to enumerate backup of {} for restore. Result {}.", target.dataTypeName(), res);
+                return {false, res, (u32)res == RES_PATH_TOO_LONG ? BackupStage::PathTooLong : BackupStage::Copy};
+            }
+
+            // A backup folder that has been through a desktop OS carries files the
+            // console never wrote — most often macOS AppleDouble sidecars, which the
+            // save archive refuses outright and which used to fail the restore with
+            // the console-side save already wiped (#577). They are not save data:
+            // drop them from the plan before anything is counted or copied.
+            const size_t dropped = io::dropHostMetadata(entries);
+            if (dropped > 0) {
+                Logging::info("Skipped {} host metadata entries in the backup; they are not part of the save.", dropped);
+            }
+
+            // The console-side twin of the backup filter. It has to run before the
+            // clear below: a file another process holds open survives the clear,
+            // and its copy would then fail with everything else already deleted —
+            // half of HOME Menu's extdata gone for a backup taken before #592.
+            if (target.kind() == BackupKind::Extdata) {
+                skippedInUse = io::dropInUse(handle.fs(), dstPath, entries);
+            }
+
+            res = io::checkPathLengths(entries, fullSrc, dstPath);
+            if (R_FAILED(res)) {
+                Logging::error("Refusing to restore {}: the backup holds a path FS cannot open.", target.dataTypeName());
+                return {false, res, BackupStage::PathTooLong};
+            }
+
+            size_t fileCount = 0;
+            for (const auto& e : entries) {
+                if (!e.folder) {
+                    fileCount++;
+                }
+            }
+
+            // Nothing to put back: restoring would only wipe what is on the console.
+            // Reachable now that metadata-only folders filter down to an empty plan.
+            if (fileCount == 0) {
+                Logging::error("Refusing to restore {}: the backup holds no files.", target.dataTypeName());
+                return {false, 0, BackupStage::EmptyBackup};
+            }
+
+            if (isTwl) {
+                // The TWL FAT `data` directory must survive; only its contents go.
+                sink.begin("Clearing", countFilesRecursively(handle.fs(), dstPath));
+                deleteFolderContentsRecursively(handle.fs(), dstPath, &sink);
+                sink.end();
+            }
+            else if (target.kind() != BackupKind::Extdata) {
+                // One syscall, nothing to report against.
+                FSUSER_DeleteDirectoryRecursively(handle.fs(), fsMakePath(PATH_UTF16, dstPath.data()));
             }
             else {
-                deleteFolderRecursively(archive, dstPath);
+                sink.begin("Clearing", countFilesRecursively(handle.fs(), dstPath));
+                deleteFolderRecursively(handle.fs(), dstPath, &sink);
+                sink.end();
             }
 
-            res = io::copyDirectory(Archive::sdmc(), archive, srcPath, dstPath);
+            sink.begin("Restore", fileCount);
+            res = io::copyTree(Archive::sdmc(), handle.fs(), fullSrc, dstPath, entries, sink);
+            sink.end();
             if (R_FAILED(res)) {
-                std::string message = mode == MODE_SAVE ? "Failed to restore save." : "Failed to restore extdata.";
-                FSUSER_CloseArchive(archive);
-                Logging::error("{}. Result {}.", message, res);
-                return std::make_tuple(false, res, message);
+                Logging::error("Failed to restore {}. Result {}.", target.dataTypeName(), res);
+                return {false, res, BackupStage::Copy};
             }
 
-            if (mode == MODE_SAVE) {
-                res = FSUSER_ControlArchive(archive, ARCHIVE_ACTION_COMMIT_SAVE_DATA, NULL, 0, NULL, 0);
+            // A TWL FAT write needs no commit and has no secure value.
+            if (target.kind() == BackupKind::Save && !isTwl) {
+                res = FSUSER_ControlArchive(handle.fs(), ARCHIVE_ACTION_COMMIT_SAVE_DATA, NULL, 0, NULL, 0);
                 if (R_FAILED(res)) {
-                    FSUSER_CloseArchive(archive);
-                    Logging::error("Failed to commit save data with result 0x{:08X}.", res);
-                    return std::make_tuple(false, res, "Failed to commit save data.");
+                    Logging::error("Failed to commit save data with result 0x{:08X}.", (u32)res);
+                    return {false, res, BackupStage::Commit};
                 }
 
                 u8 out;
                 u64 secureValue = ((u64)SECUREVALUE_SLOT_SD << 32) | (title.uniqueId() << 8);
                 res             = FSUSER_ControlSecureSave(SECURESAVE_ACTION_DELETE, &secureValue, 8, &out, 1);
                 if (R_FAILED(res)) {
-                    FSUSER_CloseArchive(archive);
-                    Logging::error("Failed to fix secure value with result 0x{:08X}.", res);
-                    return std::make_tuple(false, res, "Failed to fix secure value.");
+                    Logging::error("Failed to fix secure value with result 0x{:08X}.", (u32)res);
+                    return {false, res, BackupStage::SecureValue};
                 }
             }
         }
-        else {
-            Logging::error("Failed to open save archive with result 0x{:08X}.", res);
-            return std::make_tuple(false, res, "Failed to open save archive.");
-        }
-
-        FSUSER_CloseArchive(archive);
     }
     else {
         CardType cardType = title.SPICardType();
         u32 saveSize      = SPIGetCapacity(cardType);
         u32 pageSize      = SPIGetPageSize(cardType);
+        // NO_CHIP / an unreadable cart reports 0 capacity or page size; guard the divisions below.
+        if (saveSize == 0 || pageSize == 0) {
+            // See the matching guard in io::backup: on-cart NAND saves have no SPI
+            // chip, and writing one back needs card commands 3DS mode never issues.
+            const DSCard::NandSave nand = DSCard::probeNandSave(title.mediaType());
+            if (nand.present) {
+                DSCard::logNandSave(nand);
+                return restoreCardNandSave(target, title, nand, srcPath, sink);
+            }
+            Logging::error("SPI restore: card reports zero capacity/page size ({}).", (int)cardType);
+            return {false, res, BackupStage::OpenArchive};
+        }
 
-        std::u16string srcPath = title.fullSavePath(cellIndex);
-        srcPath += StringUtils::UTF8toUTF16("/") + StringUtils::UTF8toUTF16(title.shortDescription().c_str()) + StringUtils::UTF8toUTF16(".sav");
+        std::u16string fileName = StringUtils::UTF8toUTF16(title.shortDescription().c_str()) + StringUtils::UTF8toUTF16(".sav");
+        std::u16string fullSrc  = srcPath + StringUtils::UTF8toUTF16("/") + fileName;
 
         u8* saveFile = new u8[saveSize];
-        FSStream stream(Archive::sdmc(), srcPath, FS_OPEN_READ);
+        FSStream stream(Archive::sdmc(), fullSrc, FS_OPEN_READ);
 
         if (stream.good()) {
             stream.read(saveFile, saveSize);
@@ -398,30 +939,50 @@ std::tuple<bool, Result, std::string> io::restore(size_t index, size_t cellIndex
 
         if (R_FAILED(res)) {
             delete[] saveFile;
-            Logging::error("Failed to read save file backup with result 0x{:08X}.", res);
-            return std::make_tuple(false, res, "Failed to read save file backup.");
+            Logging::error("Failed to read save file backup with result 0x{:08X}.", (u32)res);
+            return {false, res, BackupStage::ReadFile};
         }
 
-        for (u32 i = 0; i < saveSize / pageSize; ++i) {
+        // The 8MB flash cart is write-protected until its vendor unlock runs.
+        // Detection already unlocks it, but re-arm it here so a restore is never gated by protection
+        // (idempotent and cheap: a handful of short 512KHz frames).
+        if (cardType == FLASH_8MB) {
+            SPIUnlock(cardType);
+        }
+
+        sink.begin("Restore", 1);
+        sink.startFile(fileName, saveSize);
+
+        const u32 pages = saveSize / pageSize;
+        for (u32 i = 0; i < pages; ++i) {
             res = SPIWriteSaveData(cardType, pageSize * i, saveFile + pageSize * i, pageSize);
             if (R_FAILED(res)) {
                 delete[] saveFile;
-                Logging::error("Failed to write save data to SPI with result 0x{:08X}.", res);
-                return std::make_tuple(false, res, "Failed to restore save.");
+                sink.end();
+                Logging::error("Failed to write save data to SPI with result 0x{:08X}.", (u32)res);
+                return {false, res, BackupStage::WriteFile};
             }
+            sink.advanceBytes(pageSize * (i + 1));
         }
+        sink.finishFile();
+        sink.end();
 
         delete[] saveFile;
     }
 
-    Logging::info("Restore succeeded.");
-    return std::make_tuple(true, 0, nameFromCell + "\nhas been restored successfully.");
+    if (!skippedInUse.empty()) {
+        Logging::info("Restore succeeded, leaving out {} file(s) held open by another process.", skippedInUse.size());
+    }
+    else {
+        Logging::info("Restore succeeded.");
+    }
+    return {true, 0, BackupStage::Copy, false, std::move(skippedInUse)};
 }
 
 void io::deleteBackupFolder(const std::u16string& path)
 {
     Result res = FSUSER_DeleteDirectoryRecursively(Archive::sdmc(), fsMakePath(PATH_UTF16, path.data()));
     if (R_FAILED(res)) {
-        Logging::info("Failed to delete backup folder with result 0x{:08X}.", res);
+        Logging::info("Failed to delete backup folder with result 0x{:08X}.", (u32)res);
     }
 }

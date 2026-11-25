@@ -28,6 +28,7 @@
 #include "archive.hpp"
 #include "io.hpp"
 #include "util.hpp"
+#include <algorithm>
 
 Configuration::Configuration(void)
 {
@@ -62,9 +63,54 @@ Configuration::Configuration(void)
                     (*mJson)["nand_saves"] = false;
                     updateJson             = true;
                 }
+                if (!(mJson->contains("dsiware_saves") && (*mJson)["dsiware_saves"].is_boolean())) {
+                    (*mJson)["dsiware_saves"] = false;
+                    updateJson                = true;
+                }
                 if (!(mJson->contains("scan_cart") && (*mJson)["scan_cart"].is_boolean())) {
                     (*mJson)["scan_cart"] = false;
                     updateJson            = true;
+                }
+                if (!(mJson->contains("transfer_enabled") && (*mJson)["transfer_enabled"].is_boolean())) {
+                    (*mJson)["transfer_enabled"] = false;
+                    updateJson                   = true;
+                }
+                if (!(mJson->contains("confirm_restore") && (*mJson)["confirm_restore"].is_boolean())) {
+                    (*mJson)["confirm_restore"] = true;
+                    updateJson                  = true;
+                }
+                if (!(mJson->contains("ftp-enabled") && (*mJson)["ftp-enabled"].is_boolean())) {
+                    (*mJson)["ftp-enabled"] = false;
+                    updateJson              = true;
+                }
+                if (!(mJson->contains("quick_backup") && (*mJson)["quick_backup"].is_boolean())) {
+                    (*mJson)["quick_backup"] = false;
+                    updateJson               = true;
+                }
+                if (!(mJson->contains("auto_update") && (*mJson)["auto_update"].is_boolean())) {
+                    (*mJson)["auto_update"] = true;
+                    updateJson              = true;
+                }
+                if (!(mJson->contains("theme") && (*mJson)["theme"].is_string())) {
+                    (*mJson)["theme"] = "dark";
+                    updateJson        = true;
+                }
+                if (!(mJson->contains("language") && (*mJson)["language"].is_string())) {
+                    (*mJson)["language"] = "en";
+                    updateJson           = true;
+                }
+                if (!(mJson->contains("last_transfer_address") && (*mJson)["last_transfer_address"].is_string())) {
+                    (*mJson)["last_transfer_address"] = "";
+                    updateJson                        = true;
+                }
+                if (!(mJson->contains("default_receive_pin") && (*mJson)["default_receive_pin"].is_string())) {
+                    (*mJson)["default_receive_pin"] = "";
+                    updateJson                      = true;
+                }
+                if (!(mJson->contains("server_port") && (*mJson)["server_port"].is_number_integer() &&
+                        TransferProto::validServerPort((*mJson)["server_port"].get<int64_t>()))) {
+                    (*mJson)["server_port"] = TransferProto::kDefaultServerPort;
+                    updateJson              = true;
                 }
                 if (!(mJson->contains("filter") && (*mJson)["filter"].is_array())) {
                     (*mJson)["filter"] = nlohmann::json::array();
@@ -130,8 +176,19 @@ Configuration::Configuration(void)
                 mFavoriteIds.emplace(strtoull(id.c_str(), NULL, 16));
             }
 
-            mNandSaves = (*mJson)["nand_saves"];
-            mScanCard  = (*mJson)["scan_cart"];
+            mNandSaves           = (*mJson)["nand_saves"];
+            mDSiWareSaves        = (*mJson)["dsiware_saves"];
+            mScanCard            = (*mJson)["scan_cart"];
+            mTransferEnabled     = (*mJson)["transfer_enabled"];
+            mConfirmRestore      = (*mJson)["confirm_restore"];
+            mFTPEnabled          = (*mJson)["ftp-enabled"];
+            mQuickBackup         = (*mJson)["quick_backup"];
+            mAutoUpdate          = (*mJson)["auto_update"];
+            mTheme               = (*mJson)["theme"];
+            mLanguage            = (*mJson)["language"];
+            mLastTransferAddress = (*mJson)["last_transfer_address"];
+            mDefaultReceivePin   = (*mJson)["default_receive_pin"];
+            mServerPort          = (*mJson)["server_port"];
 
             // parse additional save folders
             auto js = (*mJson)["additional_save_folders"];
@@ -185,21 +242,36 @@ void Configuration::save(void)
         fclose(out);
         oldSize = size;
     }
+    mDirty = false;
+}
+
+void Configuration::commit(void)
+{
+    if (mDirty) {
+        save();
+    }
 }
 
 bool Configuration::filter(u64 id)
 {
+    std::lock_guard<std::mutex> lock(mIdMutex);
     return mFilterIds.find(id) != mFilterIds.end();
 }
 
 bool Configuration::favorite(u64 id)
 {
+    std::lock_guard<std::mutex> lock(mIdMutex);
     return mFavoriteIds.find(id) != mFavoriteIds.end();
 }
 
 bool Configuration::nandSaves(void)
 {
     return mNandSaves;
+}
+
+bool Configuration::dsiwareSaves(void)
+{
+    return mDSiWareSaves;
 }
 
 std::vector<std::u16string> Configuration::additionalSaveFolders(u64 id)
@@ -219,4 +291,263 @@ std::vector<std::u16string> Configuration::additionalExtdataFolders(u64 id)
 bool Configuration::shouldScanCard(void)
 {
     return mScanCard;
+}
+
+bool Configuration::transferEnabled(void)
+{
+    return mTransferEnabled;
+}
+
+bool Configuration::confirmRestore(void)
+{
+    return mConfirmRestore;
+}
+
+bool Configuration::isFTPEnabled(void)
+{
+    return mFTPEnabled;
+}
+
+bool Configuration::quickBackup(void)
+{
+    return mQuickBackup;
+}
+
+bool Configuration::autoUpdate(void)
+{
+    return mAutoUpdate;
+}
+
+std::string Configuration::theme(void)
+{
+    return mTheme;
+}
+
+std::string Configuration::language(void)
+{
+    return mLanguage;
+}
+
+std::string Configuration::lastTransferAddress(void)
+{
+    return mLastTransferAddress;
+}
+
+std::string Configuration::defaultReceivePin(void)
+{
+    return mDefaultReceivePin;
+}
+
+u16 Configuration::serverPort(void)
+{
+    return mServerPort;
+}
+
+void Configuration::setNandSaves(bool v)
+{
+    mNandSaves             = v;
+    (*mJson)["nand_saves"] = v;
+    mDirty                 = true;
+}
+
+void Configuration::setDSiWareSaves(bool v)
+{
+    mDSiWareSaves             = v;
+    (*mJson)["dsiware_saves"] = v;
+    mDirty                    = true;
+}
+
+void Configuration::setScanCard(bool v)
+{
+    mScanCard             = v;
+    (*mJson)["scan_cart"] = v;
+    mDirty                = true;
+}
+
+void Configuration::setTransferEnabled(bool v)
+{
+    mTransferEnabled             = v;
+    (*mJson)["transfer_enabled"] = v;
+    mDirty                       = true;
+}
+
+void Configuration::setConfirmRestore(bool v)
+{
+    mConfirmRestore             = v;
+    (*mJson)["confirm_restore"] = v;
+    mDirty                      = true;
+}
+
+void Configuration::setFTPEnabled(bool v)
+{
+    mFTPEnabled             = v;
+    (*mJson)["ftp-enabled"] = v;
+    mDirty                  = true;
+}
+
+void Configuration::setQuickBackup(bool v)
+{
+    mQuickBackup             = v;
+    (*mJson)["quick_backup"] = v;
+    mDirty                   = true;
+}
+
+void Configuration::setAutoUpdate(bool v)
+{
+    mAutoUpdate             = v;
+    (*mJson)["auto_update"] = v;
+    mDirty                  = true;
+}
+
+void Configuration::setTheme(const std::string& v)
+{
+    mTheme            = v;
+    (*mJson)["theme"] = v;
+    mDirty            = true;
+}
+
+void Configuration::setLanguage(const std::string& v)
+{
+    mLanguage            = v;
+    (*mJson)["language"] = v;
+    mDirty               = true;
+    save();
+}
+
+void Configuration::setLastTransferAddress(const std::string& v)
+{
+    mLastTransferAddress              = v;
+    (*mJson)["last_transfer_address"] = v;
+    mDirty                            = true;
+    save();
+}
+
+void Configuration::setDefaultReceivePin(const std::string& v)
+{
+    mDefaultReceivePin              = v;
+    (*mJson)["default_receive_pin"] = v;
+    mDirty                          = true;
+    save();
+}
+
+void Configuration::setServerPort(u16 v)
+{
+    mServerPort             = v;
+    (*mJson)["server_port"] = v;
+    mDirty                  = true;
+    save();
+}
+
+// Rebuilds a json string-array of hex title ids from the given set.
+static nlohmann::json idSetToJson(const std::unordered_set<u64>& ids)
+{
+    auto arr = nlohmann::json::array();
+    for (auto id : ids) {
+        arr.push_back(StringUtils::format("%016llX", id));
+    }
+    return arr;
+}
+
+// Rebuilds a json object { "<hexid>": { "folders": [ ... ] } } from the map.
+static nlohmann::json folderMapToJson(const std::unordered_map<u64, std::vector<std::u16string>>& map)
+{
+    auto obj = nlohmann::json::object();
+    for (auto& entry : map) {
+        auto folders = nlohmann::json::array();
+        for (auto& folder : entry.second) {
+            folders.push_back(StringUtils::UTF16toUTF8(folder));
+        }
+        obj[StringUtils::format("%016llX", entry.first)]["folders"] = folders;
+    }
+    return obj;
+}
+
+void Configuration::addFavorite(u64 id)
+{
+    std::lock_guard<std::mutex> lock(mIdMutex);
+    if (!mFavoriteIds.insert(id).second) {
+        return; // already a favorite
+    }
+    (*mJson)["favorites"] = idSetToJson(mFavoriteIds);
+    mDirty                = true;
+}
+
+void Configuration::addFilter(u64 id)
+{
+    std::lock_guard<std::mutex> lock(mIdMutex);
+    if (!mFilterIds.insert(id).second) {
+        return; // already filtered
+    }
+    (*mJson)["filter"] = idSetToJson(mFilterIds);
+    mDirty             = true;
+}
+
+void Configuration::addSaveFolder(u64 id, const std::u16string& path)
+{
+    auto& vec = mAdditionalSaveFolders[id];
+    if (std::find(vec.begin(), vec.end(), path) != vec.end()) {
+        return; // already present for this title
+    }
+    vec.push_back(path);
+    (*mJson)["additional_save_folders"] = folderMapToJson(mAdditionalSaveFolders);
+    mDirty                              = true;
+}
+
+void Configuration::addExtdataFolder(u64 id, const std::u16string& path)
+{
+    auto& vec = mAdditionalExtdataFolders[id];
+    if (std::find(vec.begin(), vec.end(), path) != vec.end()) {
+        return; // already present for this title
+    }
+    vec.push_back(path);
+    (*mJson)["additional_extdata_folders"] = folderMapToJson(mAdditionalExtdataFolders);
+    mDirty                                 = true;
+}
+
+void Configuration::removeFavorite(u64 id)
+{
+    std::lock_guard<std::mutex> lock(mIdMutex);
+    if (mFavoriteIds.erase(id) == 0) {
+        return;
+    }
+    (*mJson)["favorites"] = idSetToJson(mFavoriteIds);
+    mDirty                = true;
+}
+
+void Configuration::removeFilter(u64 id)
+{
+    std::lock_guard<std::mutex> lock(mIdMutex);
+    if (mFilterIds.erase(id) == 0) {
+        return;
+    }
+    (*mJson)["filter"] = idSetToJson(mFilterIds);
+    mDirty             = true;
+}
+
+void Configuration::removeSaveFolder(u64 id, size_t index)
+{
+    auto it = mAdditionalSaveFolders.find(id);
+    if (it == mAdditionalSaveFolders.end() || index >= it->second.size()) {
+        return;
+    }
+    it->second.erase(it->second.begin() + index);
+    if (it->second.empty()) {
+        mAdditionalSaveFolders.erase(it);
+    }
+    (*mJson)["additional_save_folders"] = folderMapToJson(mAdditionalSaveFolders);
+    mDirty                              = true;
+}
+
+void Configuration::removeExtdataFolder(u64 id, size_t index)
+{
+    auto it = mAdditionalExtdataFolders.find(id);
+    if (it == mAdditionalExtdataFolders.end() || index >= it->second.size()) {
+        return;
+    }
+    it->second.erase(it->second.begin() + index);
+    if (it->second.empty()) {
+        mAdditionalExtdataFolders.erase(it);
+    }
+    (*mJson)["additional_extdata_folders"] = folderMapToJson(mAdditionalExtdataFolders);
+    mDirty                                 = true;
 }

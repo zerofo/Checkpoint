@@ -27,10 +27,11 @@
 #ifndef YESNOOVERLAY_HPP
 #define YESNOOVERLAY_HPP
 
+#include "ModalChrome.hpp"
 #include "Overlay.hpp"
-#include "SDLHelper.hpp"
 #include "clickable.hpp"
 #include "colors.hpp"
+#include "gfx.hpp"
 #include "hid.hpp"
 #include <functional>
 #include <memory>
@@ -46,8 +47,8 @@ public:
     void update(const InputState&) override;
 
 private:
-    u32 textw, texth;
     std::string text;
+    ModalChrome::Layout layout;
     std::unique_ptr<Clickable> buttonYes, buttonNo;
     Hid<HidDirection::HORIZONTAL, HidDirection::HORIZONTAL> hid;
     std::function<void()> yesFunc, noFunc;

@@ -12,6 +12,17 @@
 
   },
   "nand_saves": false,
+  "dsiware_saves": false,
   "scan_cart": false,
-  "version": 3
+  "transfer_enabled": false,
+  "confirm_restore": true,
+  "ftp-enabled": false,
+  "quick_backup": false,
+  "auto_update": true,
+  "theme": "dark",
+  "language": "en",
+  "last_transfer_address": "",
+  "default_receive_pin": "",
+  "server_port": 8000,
+  "version": 7
 }

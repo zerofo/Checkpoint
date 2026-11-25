@@ -29,14 +29,13 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
-#include <codecvt>
 #include <cstdio>
-#include <locale>
 #include <memory>
 #include <netinet/in.h>
 #include <stdarg.h>
 #include <string.h>
 #include <string>
+#include <strings.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -54,10 +53,21 @@ namespace StringUtils {
     std::string escapeJson(const std::string& s);
     std::string format(const std::string fmt_str, ...);
     std::string removeForbiddenCharacters(std::string src);
-    std::string UTF16toUTF8(const std::u16string& src);
     void ltrim(std::string& s);
     void rtrim(std::string& s);
     void trim(std::string& s);
+}
+
+namespace HostFiles {
+    // True when `name` is a file or directory a desktop OS wrote next to the real
+    // backup on the SD card rather than something the console ever produced.
+    // macOS is the usual source: a FAT/exFAT volume has nowhere to keep a file's
+    // extended attributes, so Finder stores them in an AppleDouble sidecar named
+    // "._<file>" beside it, and drops ".DS_Store" in every folder it opens.
+    // Those must never be pushed back into a save archive — a 3DS restore dies on
+    // one *after* it has already wiped the console-side save (#577). Matched by
+    // name only, so it stays a pure predicate the copy planners can filter with.
+    bool isMetadata(const std::string& name);
 }
 
 char* getConsoleIP(void);

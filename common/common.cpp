@@ -55,13 +55,6 @@ std::string DateTime::logDateTime(void)
         timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec);
 }
 
-std::string StringUtils::UTF16toUTF8(const std::u16string& src)
-{
-    static std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
-    std::string dst = convert.to_bytes(src);
-    return dst;
-}
-
 std::string StringUtils::removeForbiddenCharacters(std::string src)
 {
     static const std::string illegalChars = ".,!\\/:?*\"<>|";
@@ -114,6 +107,38 @@ void StringUtils::trim(std::string& s)
 {
     ltrim(s);
     rtrim(s);
+}
+
+bool HostFiles::isMetadata(const std::string& name)
+{
+    // AppleDouble: the sidecar is always "._" followed by the name of the file it
+    // shadows, so the prefix alone identifies it. No console-authored save file
+    // starts that way.
+    if (name.rfind("._", 0) == 0) {
+        return true;
+    }
+
+    // Fixed names desktop file managers and indexers leave behind. Case-insensitive:
+    // the SD card is FAT/exFAT, so the same file can come back as ".ds_store".
+    static const char* const known[] = {
+        ".DS_Store",
+        ".Spotlight-V100",
+        ".fseventsd",
+        ".TemporaryItems",
+        ".Trashes",
+        ".apdisk",
+        "Thumbs.db",
+        "desktop.ini",
+        "System Volume Information",
+        "$RECYCLE.BIN",
+    };
+    for (const char* entry : known) {
+        if (strcasecmp(name.c_str(), entry) == 0) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 char* getConsoleIP(void)

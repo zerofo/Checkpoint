@@ -25,6 +25,9 @@
  */
 
 #include "account.hpp"
+#include "backupsize.hpp"
+#include "gfxutils.hpp"
+#include "main.hpp"
 
 static std::map<AccountUid, User> mUsers;
 
@@ -36,7 +39,7 @@ Result Account::init(void)
 void Account::exit(void)
 {
     for (auto& value : mUsers) {
-        SDL_DestroyTexture(value.second.icon);
+        Gfx::DestroyTexture(value.second.icon);
     }
     accountExit();
 }
@@ -58,15 +61,23 @@ static User getUser(AccountUid id)
     memset(&profilebase, 0, sizeof(profilebase));
 
     if (R_SUCCEEDED(accountGetProfile(&profile, id)) && R_SUCCEEDED(accountProfileGet(&profile, NULL, &profilebase))) {
+        // "..." width at size 13, measured once and cached: trimToFit needs it to
+        // reserve space for its own ellipsis truncation marker.
+        static u32 dotsize = [] {
+            u32 w;
+            Gfx::GetTextDimensions(13, "...", &w, NULL);
+            return w;
+        }();
+
         user.name      = std::string(profilebase.nickname, 0x20);
-        user.shortName = trimToFit(user.name, 96 - g_username_dotsize * 2, 13);
+        user.shortName = trimToFit(user.name, 96 - dotsize * 2, 13);
 
         // load icon
         u8* buffer;
         u32 image_size, real_size;
         if (R_SUCCEEDED(accountProfileGetImageSize(&profile, &image_size)) && (buffer = (u8*)malloc(image_size)) != NULL &&
             R_SUCCEEDED(accountProfileLoadImage(&profile, buffer, image_size, &real_size))) {
-            SDLH_LoadImage(&user.icon, buffer, image_size);
+            Gfx::LoadImage(&user.icon, buffer, image_size);
             free(buffer);
         }
     }
@@ -99,7 +110,7 @@ std::string Account::shortName(AccountUid id)
     return got->second.shortName;
 }
 
-SDL_Texture* Account::icon(AccountUid id)
+Texture* Account::icon(AccountUid id)
 {
     std::map<AccountUid, User>::const_iterator got = mUsers.find(id);
     if (got == mUsers.end()) {
@@ -110,8 +121,27 @@ SDL_Texture* Account::icon(AccountUid id)
     return got->second.icon;
 }
 
+AccountUid Account::launchUser(void)
+{
+    // A title override launched through the user-select prompt hands over the
+    // chosen profile. Applet mode (and titles that skip the prompt) has none, so
+    // fall back to whoever last opened a game: the profile the console is
+    // currently being played under.
+    AccountUid uid{};
+    if (R_SUCCEEDED(accountGetPreselectedUser(&uid)) && accountUidIsValid(&uid))
+        return uid;
+    if (R_SUCCEEDED(accountGetLastOpenedUser(&uid)) && accountUidIsValid(&uid))
+        return uid;
+    return AccountUid{};
+}
+
 AccountUid Account::selectAccount(void)
 {
+    // Same rationale as KeyboardManager: the size-cache walk floods the FS
+    // sysmodule with IPC and delays the applet launch, so park it while the
+    // player-select applet is up.
+    BackupSizeCache::PauseGuard pauseWalk;
+
     LibAppletArgs args;
     libappletArgsCreate(&args, 0x10000);
     u8 st_in[0xA0]  = {0};

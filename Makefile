@@ -1,23 +1,27 @@
 SUBDIRS = 3ds switch
 
-VERSION_MAJOR	:=	3
-VERSION_MINOR	:=	10
-VERSION_MICRO	:=	1
-GIT_REV="$(shell git rev-parse --short HEAD)"
+VERSION_MAJOR	:=	5
+VERSION_MINOR	:=	3
+VERSION_MICRO	:=	0
+GIT_REV	:=	$(shell git rev-parse --short HEAD 2>/dev/null)
+ifeq ($(strip $(GIT_REV)),)
+GIT_REV	:=	unknown
+endif
 
 all: $(SUBDIRS)
 
 clean:
 	@for dir in $(SUBDIRS); do $(MAKE) clean -C $$dir; done
-	@rm -f sharkive/build/*.json
-	@rm -f 3ds/romfs/cheats/*.bz2
-	@rm -f switch/romfs/cheats/*.bz2 
+	@$(MAKE) clean -C tests
 
-3ds: 3ds_cheats
-	@$(MAKE) -C 3ds VERSION_MAJOR=${VERSION_MAJOR} VERSION_MINOR=${VERSION_MINOR} VERSION_MICRO=${VERSION_MICRO} GIT_REV=${GIT_REV} CHEAT_SIZE_DECOMPRESSED=$(shell stat -t "sharkive/build/3ds.json" | awk '{print $$2}')
+3ds:
+	@$(MAKE) -C 3ds VERSION_MAJOR=${VERSION_MAJOR} VERSION_MINOR=${VERSION_MINOR} VERSION_MICRO=${VERSION_MICRO} GIT_REV=${GIT_REV}
 
-switch: switch_cheats
-	@$(MAKE) -C switch VERSION_MAJOR=${VERSION_MAJOR} VERSION_MINOR=${VERSION_MINOR} VERSION_MICRO=${VERSION_MICRO} GIT_REV=${GIT_REV} CHEAT_SIZE_DECOMPRESSED=$(shell stat -t "sharkive/build/switch.json" | awk '{print $$2}')
+switch:
+	@$(MAKE) -C switch VERSION_MAJOR=${VERSION_MAJOR} VERSION_MINOR=${VERSION_MINOR} VERSION_MICRO=${VERSION_MICRO} GIT_REV=${GIT_REV}
+
+cli:
+	@$(MAKE) -C tools/chlink
 
 format:
 	@for dir in $(SUBDIRS); do $(MAKE) -C $$dir format; done
@@ -25,12 +29,9 @@ format:
 cppcheck:
 	@cppcheck . --enable=all --force 2> cppcheck.log
 
-cheats: $(SUBDIRS:=_cheats)
+# Host-side tests. They run on the build machine, not on hardware. See
+# tests/Makefile for what each one covers.
+test:
+	@$(MAKE) -C tests
 
-3ds_cheats:
-	@$(MAKE) --always-make -C 3ds cheats
-
-switch_cheats:
-	@$(MAKE) --always-make -C switch cheats
-
-.PHONY: $(SUBDIRS) clean format cppcheck cheats 3ds_cheats switch_cheats
+.PHONY: $(SUBDIRS) cli clean format cppcheck test

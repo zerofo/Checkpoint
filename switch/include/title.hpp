@@ -1,6 +1,6 @@
 /*
  *   This file is part of Checkpoint
- *   Copyright (C) 2017-2025 Bernardo Giordano, FlagBrew
+ *   Copyright (C) 2017-2026 Bernardo Giordano, FlagBrew
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -27,10 +27,10 @@
 #ifndef TITLE_HPP
 #define TITLE_HPP
 
-#include "SDLHelper.hpp"
 #include "account.hpp"
 #include "configuration.hpp"
 #include "filesystem.hpp"
+#include "gfx.hpp"
 #include "io.hpp"
 #include <algorithm>
 #include <stdlib.h>
@@ -39,14 +39,29 @@
 #include <unordered_map>
 #include <vector>
 
+// Sort order applied to a user's title list. Owned by TitleCatalog (mSortMode),
+// persisted through Configuration so it survives a relaunch; the UI reads it
+// back through SortMode::label() for both the grid's X-button cycle and the
+// Settings "Default sort" spinner — the same setting, not two.
+//
+// A named enum with a fixed underlying type so configuration.hpp can
+// forward-declare it without a full #include: title.hpp already includes
+// configuration.hpp, and configuration.hpp needs sort_t in Configuration's own
+// signature, so an #include cycle would otherwise leave sort_t undefined at the
+// point configuration.hpp needs it.
+enum sort_t : u8 { SORT_ALPHA, SORT_LAST_PLAYED, SORT_MOST_BACKUPS, SORT_FAVORITES_FIRST, SORT_MODES_COUNT };
+
 class Title {
 public:
-    void init(u8 saveDataType, u64 titleid, AccountUid userID, const std::string& name, const std::string& author);
+    // No-IO populate from values TitleProbe has already resolved (name/author from
+    // the control data, userName + on-SD path from the SaveDataSource). Computes
+    // the display name and scans the backup folders, but creates nothing.
+    void init(u8 saveDataType, u64 titleid, AccountUid userID, u8 spaceId, const std::string& name, const std::string& author,
+        const std::string& userName, const std::string& path);
     ~Title() = default;
 
     std::string author(void);
     std::string displayName(void);
-    SDL_Texture* icon(void);
     u64 id(void);
     std::string name(void);
     std::string path(void);
@@ -59,8 +74,9 @@ public:
     void refreshDirectories(void);
     u64 saveId();
     void saveId(u64 id);
-    std::vector<std::string> saves(void);
+    const std::vector<std::string>& saves(void);
     u8 saveDataType(void);
+    u8 saveDataSpaceId(void);
     AccountUid userId(void);
     std::string userName(void);
 
@@ -70,26 +86,17 @@ private:
     AccountUid mUserId;
     std::string mUserName;
     std::string mName;
-    std::string mSafeName;
     std::string mAuthor;
     std::string mPath;
     std::vector<std::string> mSaves;
     std::vector<std::string> mFullSavePaths;
     u8 mSaveDataType;
+    u8 mSaveDataSpaceId;
     std::string mDisplayName;
     u64 mPlayTimeNanoseconds;
     u32 mLastPlayedTimestamp;
 };
 
-void getTitle(Title& dst, AccountUid uid, size_t i);
-size_t getTitleCount(AccountUid uid);
-void loadTitles(void);
-void sortTitles(void);
-void rotateSortMode(void);
-void refreshDirectories(u64 id);
-bool favorite(AccountUid uid, int i);
-void freeIcons(void);
-SDL_Texture* smallIcon(AccountUid uid, size_t i);
-std::unordered_map<std::string, std::string> getCompleteTitleList(void);
+typedef enum { FILTER_SAVES, FILTER_BCAT, FILTER_DEVICE, FILTER_SYSTEM } saveTypeFilter_t;
 
 #endif

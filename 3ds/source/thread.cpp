@@ -112,8 +112,11 @@ namespace {
                     return Task{nullptr, nullptr};
                 }
                 else {
-                    Task ret = tasks.get()[0];
-                    tasks->erase(tasks->begin());
+                    // LIFO: pop the most recently queued task. While browsing the title
+                    // list this hands a worker the folder-size job for the title the user
+                    // just landed on before the now-unfocused ones queued earlier.
+                    Task ret = tasks->back();
+                    tasks->pop_back();
                     return ret;
                 }
             });
@@ -190,6 +193,13 @@ void Threads::executeTask(void (*task)(void*), void* arg)
 
 void Threads::exit(void)
 {
+    // Idempotent: called explicitly at the end of main (so every worker is joined
+    // before exit() runs static destructors) and again via atexit as a backstop
+    // for early-error exits that never reach the explicit call.
+    static std::atomic<bool> alreadyExited{false};
+    if (alreadyExited.exchange(true)) {
+        return;
+    }
     workerTasks.lock()->clear();
     LightSemaphore_Release(&moreTasks, numWorkers);
     svcSignalEvent(threads.lock()->second[0]);

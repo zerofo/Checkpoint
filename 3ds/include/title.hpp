@@ -47,27 +47,32 @@ extern "C" {
 
 #define TID_PKSM 0x000400000EC10000
 
+class BackupTarget;
+
 class Title {
 public:
     ~Title(void);
 
+    // Vend a backup facet (Save or Extdata) of this Title. The returned target
+    // holds a reference back to this Title, so keep it shorter-lived.
+    BackupTarget backup(BackupKind kind);
+
     bool accessibleSave(void);
     bool accessibleExtdata(void);
+    bool isGBAVC(void);
+    bool isDSiWare(void);
     FS_CardType cardType(void);
     std::vector<std::u16string> extdata(void);
     u32 extdataId(void);
     std::u16string extdataPath(void);
     std::u16string fullExtdataPath(size_t index);
     u32 highId(void);
-    C2D_Image icon(void);
-    u64 id(void);
-    bool isActivityLog(void);
+    u64 id(void) const;
     void load(void);
-    bool load(u64 id, FS_MediaType mediaType, FS_CardType cardType);
-    void load(u64 id, u8* productCode, bool accessibleSave, bool accessibleExtdata, std::u16string shortDescription, std::u16string longDescription,
-        std::u16string savePath, std::u16string extdataPath, FS_MediaType media, FS_CardType cardType, CardType card);
-    std::string longDescription(void);
-    std::u16string getLongDescription(void);
+    void load(u64 id, u8* productCode, bool accessibleSave, bool saveIsGBA, bool accessibleExtdata, std::string shortDescription,
+        std::string longDescription, std::u16string savePath, std::u16string extdataPath, FS_MediaType media, FS_CardType cardType, CardType card,
+        bool cardNandSave = false);
+    const std::string& longDescription(void) const;
     u32 lowId(void);
     FS_MediaType mediaType(void);
     std::string mediaTypeString(void);
@@ -75,19 +80,28 @@ public:
     std::u16string savePath(void);
     std::u16string fullSavePath(size_t index);
     std::vector<std::u16string> saves(void);
-    void setIcon(C2D_Image icon);
-    std::string shortDescription(void);
-    std::u16string getShortDescription(void);
+    const std::string& shortDescription(void) const;
     CardType SPICardType(void);
+    // True for a DS cartridge that keeps its save in on-cart NAND rather than on
+    // an SPI chip. Backing one up drives the cartridge directly for a minute or
+    // more, so the UI warns before starting; see DSCardNand.
+    bool cardNandSave(void) const;
     u32 uniqueId(void);
 
     char productCode[16];
 
 private:
+    // Fill `names`/`fullPaths` with the "New..." entry, the sorted backup folders
+    // under `basePath`, then any configured additional folders. Shared by the
+    // save and extdata halves of refreshDirectories (descending = save order).
+    void loadBackupList(const std::u16string& basePath, const std::vector<std::u16string>& additionalFolders, bool descending,
+        std::vector<std::u16string>& names, std::vector<std::u16string>& fullPaths);
+
     bool mAccessibleSave;
     bool mAccessibleExtdata;
-    std::u16string mShortDescription;
-    std::u16string mLongDescription;
+    bool mGBA;
+    std::string mShortDescription;
+    std::string mLongDescription;
     std::u16string mSavePath;
     std::u16string mExtdataPath;
 
@@ -99,9 +113,7 @@ private:
     FS_MediaType mMedia;
     FS_CardType mCard;
     CardType mCardType;
-    C2D_Image mIcon;
+    bool mCardNandSave;
 };
-
-C2D_Image loadTextureFromBytes(u16* bigIconData);
 
 #endif

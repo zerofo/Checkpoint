@@ -25,13 +25,11 @@
  */
 
 #include "clickable.hpp"
+#include "textpool.hpp"
 
 void Clickable::c2dText(const std::string& v)
 {
     text(v);
-    mTextBuf = C2D_TextBufNew(64);
-    C2D_TextParse(&mC2dText, mTextBuf, v.c_str());
-    C2D_TextOptimize(&mC2dText);
 }
 
 bool Clickable::held()
@@ -74,8 +72,13 @@ void Clickable::draw(float size, u32 overlayWhenFocused)
         g = 0;
         b = 0;
     }
-    const float messageHeight = ceilf(size * fontGetInfo(NULL)->lineFeed);
-    const float messageWidth  = mCentered ? mC2dText.width * size : mw - 8;
+    // Localized labels can outgrow the box: shrink the scale a little first
+    // (down to 80%), then ellipsis-truncate whatever still overflows.
+    const float availWidth    = mCentered ? mw - 8 : mw - 16;
+    const float drawSize      = TextPool::get().fitScale(text(), availWidth, size, size * 0.8f);
+    const std::string message = TextPool::get().truncate(text(), availWidth, drawSize);
+    const float messageHeight = ceilf(drawSize * fontGetInfo(NULL)->lineFeed);
+    const float messageWidth  = mCentered ? TextPool::get().width(message, drawSize) : mw - 8;
 
     C2D_DrawRectSolid(mx, my, 0.5f, mw, mh, mColorBg);
     if (mCanChangeColorWhenSelected && held()) {
@@ -88,7 +91,7 @@ void Clickable::draw(float size, u32 overlayWhenFocused)
         C2D_DrawRectSolid(mx, my, 0.5f, mw, mh, C2D_Color32(r, g, b, 100));
     }
     int offset = ceilf(mx + (mw - messageWidth) / 2) + (!mCentered ? 8 : 0);
-    C2D_DrawText(&mC2dText, C2D_WithColor, offset, ceilf(my + (mh - messageHeight) / 2), 0.5f, size, size, mColorText);
+    TextPool::get().draw(message, offset, ceilf(my + (mh - messageHeight) / 2), drawSize, mColorText);
 }
 
 void Clickable::drawOutline(u32 color)

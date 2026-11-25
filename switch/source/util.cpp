@@ -1,6 +1,6 @@
 /*
  *   This file is part of Checkpoint
- *   Copyright (C) 2017-2025 Bernardo Giordano, FlagBrew
+ *   Copyright (C) 2017-2026 Bernardo Giordano, FlagBrew
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -25,18 +25,57 @@
  */
 
 #include "util.hpp"
+#include "configuration.hpp"
+#include "ftpserver.hpp"
+#include "i18n.hpp"
+#include "logging.hpp"
+#include "main.hpp"
+#include "mtpserver.hpp"
+#include "server.hpp"
+#include "sleepguard.hpp"
+#include "titlecatalog.hpp"
+
+namespace {
+    // FTP uses a command socket plus a short-lived data socket per concurrent
+    // transfer. The libnx defaults are sized for general client networking and
+    // can exhaust bsd:u's socket-buffer pool during a directory upload, leaving
+    // PASV listeners unable to accept and eventually timing out. Match the
+    // standalone Switch ftpd configuration, with one extra BSD service session
+    // for Checkpoint's HTTP/log and script traffic.
+    constexpr SocketInitConfig SOCKET_INIT_CONFIG = {
+        .tcp_tx_buf_size     = 1 * 1024 * 1024,
+        .tcp_rx_buf_size     = 1 * 1024 * 1024,
+        .tcp_tx_buf_max_size = 4 * 1024 * 1024,
+        .tcp_rx_buf_max_size = 4 * 1024 * 1024,
+        .udp_tx_buf_size     = 0x2400,
+        .udp_rx_buf_size     = 0xA500,
+        .sb_efficiency       = 8,
+        .num_bsd_sessions    = 3,
+        .bsd_service_type    = BsdServiceType_User,
+    };
+}
 
 void servicesExit(void)
 {
-    if (g_ftpAvailable)
-        ftp_exit();
+    // Nothing is left running that needs the console awake; also covers a
+    // transfer that ended by an early exit path rather than TransferStatus::end.
+    SleepGuard::release();
+
+    // Stop and join the servers before socketExit tears the socket layer down
+    // under them, and before Logging::exit() closes the log they write to.
+    // FTPServer::exit() is normally already done at the end of main(); this
+    // covers the early-exit paths that call servicesExit() without reaching it.
+    FTPServer::exit();
+    MTPServer::exit();
+    Server::exit();
+    Logging::exit();
     if (g_notificationLedAvailable)
         hidsysExit();
     pdmqryExit();
     socketExit();
     Account::exit();
-    freeIcons();
-    SDLH_Exit();
+    TitleCatalog::get().freeIcons();
+    Gfx::Exit();
     nsExit();
     plExit();
     romfsExit();
@@ -47,7 +86,22 @@ Result servicesInit(void)
     io::createDirectory("sdmc:/switch");
     io::createDirectory("sdmc:/switch/Checkpoint");
     io::createDirectory("sdmc:/switch/Checkpoint/saves");
+    io::createDirectory("sdmc:/switch/Checkpoint/bcat");
+    io::createDirectory("sdmc:/switch/Checkpoint/device");
+    io::createDirectory("sdmc:/switch/Checkpoint/system");
     io::createDirectory("sdmc:/switch/Checkpoint/logs");
+    // Script drop-in point, so users find it (see Paths::scriptsRoot).
+    io::createDirectory("sdmc:/switch/Checkpoint/scripts");
+    io::createDirectory("sdmc:/switch/Checkpoint/scripts/universal");
+
+    // Sets the log file path and registers the /logs HTTP handlers (the shared
+    // logging module registers them under the SERVER_HPP guard); then open the
+    // file so /logs/file and on-disk logging work too.
+    Logging::init();
+    Logging::initFileLogging();
+    // Now that the log file is open, catch any uncaught throw with a disk
+    // breadcrumb before the process dies.
+    Logging::installCrashHandlers();
 
     Logging::info("Starting Checkpoint loading...");
 
@@ -56,14 +110,12 @@ Result servicesInit(void)
     }
 
     Result socinit = 0;
-    if ((socinit = socketInitializeDefault()) == 0) {
+    if ((socinit = socketInitialize(&SOCKET_INIT_CONFIG)) == 0) {
         // nxlinkStdio();
     }
     else {
         Logging::info("Unable to initialize socket. Result code 0x{:08X}.", socinit);
     }
-
-    g_shouldExitNetworkLoop = R_FAILED(socinit);
 
     Result res = 0;
 
@@ -87,8 +139,8 @@ Result servicesInit(void)
         return res;
     }
 
-    if (!SDLH_Init()) {
-        Logging::error("SDLH_Init failed. Result code 0x{:08X}.", res);
+    if (!Gfx::Init()) {
+        Logging::error("Gfx::Init failed. Result code 0x{:08X}.", res);
         return -1;
     }
 
@@ -101,15 +153,21 @@ Result servicesInit(void)
 
     Configuration::getInstance();
 
+    // Load localized strings before any screen draws.
+    i18n::init("romfs:/i18n.json");
+    i18n::setLanguage(Configuration::getInstance().language());
+
+    // Both servers need the socket layer up; skip them if socket init failed.
+    // The log server binds the port from config.json, which a first launch
+    // seeds from romfs, so it can't start any earlier than this.
     if (R_SUCCEEDED(socinit)) {
-        if (R_SUCCEEDED(res = ftp_init())) {
-            g_ftpAvailable = true;
-            Logging::info("FTP Server successfully loaded.");
-        }
-        else {
-            Logging::info("FTP Server failed to load. Result code 0x{:08X}.", res);
-        }
+        Server::init(Configuration::getInstance().serverPort());
+        FTPServer::init();
     }
+
+    // MTP rides the USB cable, so unlike FTP it doesn't care whether the socket
+    // layer came up. The worker idles until the toggle is switched on.
+    MTPServer::init();
 
     if (R_SUCCEEDED(res = pdmqryInitialize())) {}
     else {
@@ -123,9 +181,26 @@ Result servicesInit(void)
 
 std::u16string StringUtils::UTF8toUTF16(const char* src)
 {
-    char16_t tmp[256] = {0};
-    utf8_to_utf16((uint16_t*)tmp, (uint8_t*)src, 256);
-    return std::u16string(tmp);
+    const uint8_t* in = (const uint8_t*)src;
+    ssize_t units     = utf8_to_utf16(nullptr, in, 0);
+    if (units < 0) {
+        return u"";
+    }
+    std::u16string dst(units, u'\0');
+    utf8_to_utf16((uint16_t*)dst.data(), in, units + 1);
+    return dst;
+}
+
+std::string StringUtils::UTF16toUTF8(const std::u16string& src)
+{
+    const uint16_t* in = (const uint16_t*)src.c_str();
+    ssize_t units      = utf16_to_utf8(nullptr, in, 0);
+    if (units < 0) {
+        return "";
+    }
+    std::string dst(units, '\0');
+    utf16_to_utf8((uint8_t*)dst.data(), in, units + 1);
+    return dst;
 }
 
 // https://stackoverflow.com/questions/14094621/change-all-accented-letters-to-normal-letters-in-c
